@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
 import {webcrypto} from 'node:crypto';
+import {readShareToken} from '../web/cloud.js';
 import {fileURLToPath} from 'node:url';
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
@@ -13,8 +14,8 @@ const appSource=fs.readFileSync(path.join(root,'web/app.js'),'utf8')
 const languageSource=fs.readFileSync(path.join(root,'web/i18n.js'),'utf8')
   .replaceAll('export function','function');
 
-function harness({hostname='localhost',search=''}={}){
-  const events=new Map(),nodes=new Map(),storage=new Map(),requests=[];
+function harness({hostname='localhost',search='',hash=''}={}){
+  const events=new Map(),windowEvents=new Map(),nodes=new Map(),storage=new Map(),requests=[];
   const makeNode=(extra={})=>({innerHTML:'',textContent:'',className:'',isConnected:true,
     open:false,disabled:false,close(){this.open=false;},showModal(){this.open=true;},
     addEventListener(){},querySelector:selector=>nodes.get(selector)||null,...extra});
@@ -23,28 +24,37 @@ function harness({hostname='localhost',search=''}={}){
     querySelectorAll:()=>[],addEventListener:(name,callback)=>events.set(name,callback)};
   let respond=async()=>{throw Error('Unexpected network access in a synthetic test');};
   const client={getSession:async()=>null,onAuthChange:()=>()=>{},destroy(){},getData:async()=>fixture()};
-  const context=vm.createContext({document,location:{hostname,search,pathname:'/',href:'/'+search},
-    window:{addEventListener(){},scrollTo(){},open(){}},URL,URLSearchParams,Intl,Date,Math,Map,Set,
+  const context=vm.createContext({document,location:{hostname,search,hash,pathname:'/',href:'/'+search+hash},
+    window:{addEventListener:(name,callback)=>windowEvents.set(name,callback),scrollTo(){},open(){}},URL,URLSearchParams,Intl,Date,Math,Map,Set,
     localStorage:{getItem:key=>storage.get(key)||null,setItem:(key,value)=>storage.set(key,value)},
     crypto:webcrypto,structuredClone,setTimeout:()=>0,clearTimeout(){},Image:class {},
     FormData:class {constructor(form){this.values=form.values||{};}get(key){return this.values[key]??null;}
       getAll(key){const value=this.values[key];return Array.isArray(value)?value:value?[value]:[];}},
     cloudConfig:{supabaseUrl:'https://test.supabase.co',supabaseAnonKey:'synthetic-public-key'},
-    createCloudClient:()=>client,
+    createCloudClient:()=>client,readShareToken,
+    createShareClient:(config,token,options)=>{client.shareToken=token;client.onDenied=options.onDenied;return client;},
     fetch:async(url,options)=>{requests.push({url,options});return respond(url,options);},
   });
   vm.runInContext(languageSource,context,{filename:'i18n.js'});
   vm.runInContext(appSource+`\nglobalThis.ui={state,t,init,render,chapterHome,shell,chapterTabs,heading,
     filteredVisits,appointments,medicineList,medicinePhotos,filesPage,renderDetail,empty,
     act,loadData,fileUrl,sourceIds,isLocal,gatherEditor,renderEditor,sampleData,
-    medicineRows,medicineCategoryKey,categoryNav};`,context,{filename:'app.js'});
+    medicineRows,medicineCategoryKey,categoryNav,sharePanel,loadShareStatus};`,context,{filename:'app.js'});
   const ui=context.ui;
   ui.state.mode='local';ui.state.view??='manage';ui.state.boot={csrf_token:'synthetic-csrf'};
   ui.state.data=fixture();
   const action=(name,dataset={})=>ui.act(name,{target:{closest:()=>({dataset,isConnected:true})}});
-  return {ui,context,nodes,events,requests,client,action,
+  return {ui,context,nodes,events,windowEvents,requests,client,action,
     setResponse:fn=>{respond=fn;},json:payload=>({ok:true,json:async()=>payload})};
 }
+
+function deferred(){
+  let resolve,reject;
+  const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});
+  return {promise,resolve,reject};
+}
+
+const nextTurn=()=>new Promise(resolve=>setImmediate(resolve));
 
 function fixture(){
   const attachment=(id,patient_id,privacy_checked=true)=>({id,patient_id,privacy_checked,
@@ -217,7 +227,7 @@ test('family preview reads the safe endpoint and management reads its own endpoi
 });
 
 test('family views render no upload, settings, editing or confirmation controls',()=>{
-  for(const mode of ['local','cloud']){
+  for(const mode of ['local','cloud','share']){
     const h=harness();Object.assign(h.ui.state,{mode,view:'family',person:'grandpa',detail:'visit-pa'});
     const html=[h.ui.chapterHome(),h.ui.shell(),h.ui.chapterTabs(),h.ui.heading(),h.ui.renderDetail(),h.ui.empty()].join('');
     assert.doesNotMatch(html,/data-action="(?:new|scan|upload|edit|confirm|redact|backup|restore|export)"/);
@@ -267,4 +277,124 @@ test('thumbnail and original routes remain distinct, and chapter images retain f
   assert.equal(await h.ui.fileUrl(a,true),'blob:preview');
   assert.equal(await h.ui.fileUrl(a,false),'blob:original');
   assert.equal(thumbnailCalls,1);assert.equal(originalCalls,1);
+});
+
+
+test('remote share links bypass login and force family-only view even with manage/demo queries',async()=>{
+  const h=harness({hostname:'family.example',search:'?view=manage&demo=1',hash:'#share='+'A'.repeat(43)});
+  await h.ui.init();
+  assert.equal(h.ui.state.view,'family');assert.equal(h.ui.state.mode,'share');
+  assert.equal(h.ui.state.demo,false);assert.equal(h.client.shareToken,'A'.repeat(43));
+  assert.doesNotMatch(h.nodes.get('#app').innerHTML,/login-form|data-action="logout"/);
+  for(const action of ['share-create','share-rotate-apply','share-revoke-apply','share-copy','new','backup'])
+    await assert.rejects(h.action(action));
+  assert.equal(h.requests.length,0);
+});
+
+test('malformed share link fails closed instead of falling back to an existing account',async()=>{
+  const h=harness({hostname:'family.example',hash:'#share=broken'});
+  h.client.getSession=async()=>({access_token:'synthetic-session'});
+  await h.ui.init();assert.equal(h.ui.state.mode,'share-denied');
+  assert.equal(h.ui.state.data.visits.length,0);
+  assert.doesNotMatch(h.nodes.get('#app').innerHTML,/login-form|GRANDPA_DOCTOR/);
+});
+
+test('access denial clears records, open detail and image URLs',async()=>{
+  const h=harness({hostname:'family.example',hash:'#share='+'B'.repeat(43)});
+  await h.ui.init();h.ui.state.person='grandpa';h.ui.state.detail='visit-pa';
+  h.client.onDenied();
+  assert.equal(h.ui.state.mode,'share-denied');assert.equal(h.ui.state.data.visits.length,0);
+  assert.equal(h.ui.state.person,null);assert.equal(h.ui.state.detail,null);
+  assert.doesNotMatch(h.nodes.get('#app').innerHTML,/GRANDPA_DOCTOR|login-form/);
+});
+
+test('local share status uses CSRF on GET and only displays a verified active URL',async()=>{
+  const h=harness();h.ui.state.boot.cloud={configured:true};
+  h.setResponse(()=>h.json({configured:true,status:'active',verified:true,url:'https://family.example/#share=SYNTHETIC'}));
+  await h.ui.loadShareStatus();
+  assert.equal(h.requests.at(-1).url,'/api/share');
+  assert.equal(h.requests.at(-1).options.headers['X-CSRF-Token'],'synthetic-csrf');
+  assert.match(h.ui.sharePanel(),/share-copy|share-rotate|share-revoke/);
+  h.ui.state.share.verified=false;assert.doesNotMatch(h.ui.sharePanel(),/SYNTHETIC|share-copy/);
+});
+
+for(const olderFailsFirst of [true,false]){
+  test(`stale share init rejection cannot override a newer ${olderFailsFirst?'pending':'completed'} share`,async()=>{
+    const oldToken='A'.repeat(43),newToken='B'.repeat(43);
+    const h=harness({hostname:'family.example',hash:'#share='+oldToken});
+    const oldData=deferred(),newData=deferred();
+    const oldClient={getData:()=>oldData.promise,destroy(){this.destroyed=true;}};
+    const newClient={getData:()=>newData.promise,destroy(){this.destroyed=true;}};
+    h.context.createShareClient=(config,token,options)=>{
+      const client=token===oldToken?oldClient:newClient;
+      client.onDenied=options.onDenied;
+      return client;
+    };
+    const firstInit=h.ui.init();
+    assert.equal(h.ui.state.client,oldClient);
+    h.context.location.hash='#share='+newToken;
+    const secondInit=h.ui.init();
+    assert.equal(oldClient.destroyed,true);
+    assert.equal(h.ui.state.client,newClient);
+    const currentData=fixture();currentData.visits[0].doctor='NEW_SHARE_DOCTOR';
+    const rejectOld=async()=>{
+      // A late access-denied callback and a late request rejection must both be ignored.
+      oldClient.onDenied();
+      oldData.reject(new Error('OLD_SHARE_REQUEST_FAILED'));
+      await firstInit;
+      assert.equal(h.ui.state.mode,'share');
+      assert.equal(h.ui.state.client,newClient);
+      assert.equal(h.ui.state.error,null);
+    };
+    if(olderFailsFirst)await rejectOld();
+    newData.resolve(currentData);await secondInit;
+    if(!olderFailsFirst)await rejectOld();
+    assert.equal(h.ui.state.data.visits[0].doctor,'NEW_SHARE_DOCTOR');
+    assert.doesNotMatch(h.nodes.get('#app').innerHTML,/OLD_SHARE_REQUEST_FAILED|login-form/);
+    assert.equal(h.requests.length,0);
+  });
+}
+
+test('hashchange immediately clears rendered medical data, editor and dialogs before the new share resolves',async()=>{
+  const oldToken='C'.repeat(43),newToken='D'.repeat(43);
+  const h=harness({hostname:'family.example',hash:'#share='+oldToken});
+  const newData=deferred(),oldImage=deferred();
+  const oldClient={getData:async()=>fixture(),fileUrl:()=>oldImage.promise,destroy(){this.destroyed=true;}};
+  const newClient={getData:()=>newData.promise,destroy(){this.destroyed=true;}};
+  h.context.createShareClient=(config,token)=>token===oldToken?oldClient:newClient;
+  await h.ui.init();
+  Object.assign(h.ui.state,{person:'grandpa',detail:'visit-pa',route:'visits'});
+  // Use the real detail renderer as the currently visible medical DOM.
+  h.nodes.get('#app').innerHTML='<main>'+h.ui.renderDetail()+'</main>';
+  assert.match(h.nodes.get('#app').innerHTML,/GRANDPA_DOCTOR/);
+  const priorImage=h.action('view-file',{id:'pa-visit-a'});
+  const discardedImage=assert.rejects(priorImage);
+  assert.equal(h.nodes.get('#dialog').open,true);
+  h.ui.state.editor={id:'SYNTHETIC_OLD_EDITOR'};
+  h.ui.state.urls.set('old-preview','blob:synthetic-prior-share');
+  h.context.location.hash='#share='+newToken;
+  h.windowEvents.get('hashchange')();
+
+  // These assertions run synchronously, while the replacement fetch is pending.
+  assert.equal(oldClient.destroyed,true);
+  assert.equal(h.ui.state.client,newClient);
+  assert.equal(h.ui.state.data.visits.length,0);
+  assert.equal(h.ui.state.data.attachments.length,0);
+  assert.equal(h.ui.state.person,null);
+  assert.equal(h.ui.state.detail,null);
+  assert.equal(h.ui.state.editor,null);
+  assert.equal(h.ui.state.urls.size,0);
+  assert.equal(h.nodes.get('#dialog').open,false);
+  assert.doesNotMatch(h.nodes.get('#app').innerHTML,/GRANDPA_DOCTOR|GRANDPA_MED|SYNTHETIC_OLD_EDITOR/);
+  assert.ok(h.nodes.get('#app').innerHTML.includes(h.ui.t('loading')));
+
+  oldImage.resolve('blob:synthetic-late-old-image');await discardedImage;
+  assert.equal(h.nodes.get('#dialog').open,false);
+  assert.doesNotMatch(h.nodes.get('.dialog-body').innerHTML,/synthetic-late-old-image/);
+  const replacement=fixture();replacement.visits[0].doctor='REPLACEMENT_SHARE_DOCTOR';
+  newData.resolve(replacement);await nextTurn();
+  assert.equal(h.ui.state.mode,'share');
+  assert.equal(h.ui.state.data.visits[0].doctor,'REPLACEMENT_SHARE_DOCTOR');
+  assert.equal(h.ui.state.client,newClient);
+  assert.equal(h.requests.length,0);
 });

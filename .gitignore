@@ -9,3 +9,8 @@ dist/
 test-output/
 .impeccable/
 *.log
+
+# Local release packages and convenience launchers stay on this computer.
+/releases/
+/安康簿*.cmd
+/開啟安康簿.cmd

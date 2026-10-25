@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
 from healthlib.store import HealthStore, ValidationError, PrivacyReviewRequired, decode_base64, MAX_BACKUP_BYTES
+from tools.share import ShareManager, ShareError
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -131,6 +132,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response(self.store.data())
             if route == "/api/family-data":
                 return self.json_response(self.store.family_data())
+            if route == "/api/share":
+                if not self.guard(mutate=True):
+                    return
+                return self.json_response(ShareManager(self.store.data_dir).status())
             if route == "/api/queue":
                 return self.json_response(self.store.queue())
             if route.startswith("/api/files/") and route.endswith("/thumbnail"):
@@ -150,6 +155,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.file_response(path)
         except PrivacyReviewRequired as exc:
             self.json_response({"error": str(exc)}, 403)
+        except ShareError:
+            self.json_response({"error": "未能讀取分享設定，請檢查本機設定後重試。"}, 503)
         except ValidationError as exc:
             self.json_response({"error": str(exc)}, 400)
         except OSError:
@@ -185,9 +192,14 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.store.restore_apply(value.get("token"))
             elif route == "/api/export":
                 result = self.store.export_snapshot()
+            elif route in {"/api/share/create", "/api/share/rotate", "/api/share/revoke"}:
+                manager = ShareManager(self.store.data_dir)
+                result = getattr(manager, route.rsplit("/", 1)[1])()
             else:
                 return self.json_response({"error": "找不到功能"}, 404)
             self.json_response(result)
+        except ShareError as exc:
+            self.json_response({"error": str(exc)}, 503)
         except ValidationError as exc:
             self.json_response({"error": str(exc)}, 400)
         except (OSError, sqlite3.Error):

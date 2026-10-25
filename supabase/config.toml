@@ -1,0 +1,4 @@
+[functions.family-share]
+# The 256-bit capability in the POST body is authenticated by this handler.
+# The endpoint does not accept anonymous access without that capability.
+verify_jwt = false

@@ -140,4 +140,27 @@ await thumbnails.thumbnailUrl(unsafeMetadata.attachments[0]);
 assert.equal(requests.some(r => r.url.includes('/other/')), false);
 assert.equal(requests.some(r => r.url.endsWith('/photo.png')), true);
 await thumbnails.signOut();
-console.log('Cloud client: auth/privacy/read-only/race checks and private compressed-preview/original separation passed.');
+
+// The exact empty bootstrap SQL payload must load as a valid, empty family archive.
+const bootstrapSql = await readFile(new URL('../supabase/002_bootstrap_empty.sql', import.meta.url), 'utf8');
+const bootstrapMatch = bootstrapSql.match(/'(\{\s*"schema_version"[\s\S]*?\})'::jsonb/);
+assert.ok(bootstrapMatch, 'Bootstrap must contain a static empty schema payload');
+const emptySnapshot = JSON.parse(bootstrapMatch[1]);
+globalThis.fetch = async (url, options) => {
+  if (url.includes('/family_snapshots?')) return response([{ published_at: '2026-10-25', snapshot: emptySnapshot }]);
+  return normalFetch(url, options);
+};
+const emptyArchive = createCloudClient(config);
+await emptyArchive.signIn('viewer@example.invalid', 'test');
+requests = [];
+const emptyData = await emptyArchive.getData();
+assert.deepEqual(emptyData.patients, [
+  {id:'grandpa',name:'爺爺',age:null,sex:'unknown'},
+  {id:'grandma',name:'嬷嬷',age:null,sex:'unknown'},
+]);
+assert.deepEqual(emptyData.visits, []);
+assert.deepEqual(emptyData.attachments, []);
+assert.equal(requests.some(r => r.url.includes('/storage/')), false);
+await assert.rejects(emptyArchive.fileUrl({id:'absent'}), /未獲授權/);
+await emptyArchive.signOut();
+console.log('Cloud client: auth/privacy/read-only/race, private previews, and exact empty-bootstrap payload checks passed.');

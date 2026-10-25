@@ -180,3 +180,210 @@ export function createCloudClient(config = {}) {
     destroy() { clearFiles(); listeners.clear(); },
   };
 }
+
+const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const SHARE_DENIED = '分享連結無效或已失效，請向管理人索取新連結。';
+const SHARE_UNAVAILABLE = '暫時未能讀取分享紀錄，請稍後再試。';
+const SHARE_MAX_IMAGE = 25 * 1024 * 1024;
+const SHARE_MAX_SNAPSHOT = 16 * 1024 * 1024;
+
+/** Only fragments carry the capability. Do not inspect a query string or persist it. */
+export function readShareToken(hash) {
+  const fragment = typeof hash === 'string' ? hash.replace(/^#/, '') : '';
+  const values = new URLSearchParams(fragment).getAll('share');
+  if (!values.length) return null;
+  if (values.length !== 1 || !SHARE_TOKEN_PATTERN.test(values[0])) throw new Error(SHARE_DENIED);
+  return values[0];
+}
+
+/** Read-only capability client; the token exists only in this instance's memory. */
+export function createShareClient(config, token, {onDenied} = {}) {
+  const base = String(config?.supabaseUrl || '').replace(/\/$/, '');
+  if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(base)) {
+    throw new Error('分享服務尚未設定，請聯絡管理人。');
+  }
+  if (typeof token !== 'string' || !SHARE_TOKEN_PATTERN.test(token)) throw new Error(SHARE_DENIED);
+  const endpoint = base + '/functions/v1/family-share';
+  let capability = token;
+  token = undefined;
+  let epoch = 0;
+  let destroyed = false;
+  let denied = false;
+  let availableFiles = new Map();
+  const blobUrls = new Map();
+  const pendingImages = new Map();
+  const safeId = /^[A-Za-z0-9_-]{1,96}$/;
+  const safeHash = /^[a-f0-9]{64}$/;
+  const imageTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
+
+  function clearFiles() {
+    for (const url of blobUrls.values()) URL.revokeObjectURL(url);
+    blobUrls.clear();
+    pendingImages.clear();
+    availableFiles.clear();
+  }
+  function requireEpoch(expected) {
+    if (destroyed || denied || !capability) throw new Error(SHARE_DENIED);
+    if (expected !== epoch) throw new Error(SHARE_UNAVAILABLE);
+  }
+  function denyAccess() {
+    if (destroyed || denied) return;
+    denied = true;
+    capability = null;
+    ++epoch;
+    clearFiles();
+    if (typeof onDenied === 'function') {
+      try { onDenied(); } catch { /* The view cannot prevent local credential cleanup. */ }
+    }
+  }
+  async function request(payload, expected) {
+    requireEpoch(expected);
+    let response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST', cache: 'no-store', credentials: 'omit', redirect: 'error',
+        referrerPolicy: 'no-referrer', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({token: capability, ...payload}),
+      });
+    } catch { throw new Error(SHARE_UNAVAILABLE); }
+    if (response.status === 403) {
+      denyAccess();
+      throw new Error(SHARE_DENIED);
+    }
+    requireEpoch(expected);
+    if (!response.ok) throw new Error(SHARE_UNAVAILABLE);
+    return response;
+  }
+  async function boundedBytes(response, limit, expected) {
+    const declared = response.headers.get('content-length');
+    if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > limit)) {
+      throw new Error(SHARE_UNAVAILABLE);
+    }
+    if (!response.body) throw new Error(SHARE_UNAVAILABLE);
+    const reader = response.body.getReader();
+    const chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const result = await reader.read();
+        requireEpoch(expected);
+        if (result.done) break;
+        size += result.value.byteLength;
+        if (size > limit) {
+          await reader.cancel();
+          throw new Error(SHARE_UNAVAILABLE);
+        }
+        chunks.push(result.value);
+      }
+    } catch (error) {
+      try { await reader.cancel(); } catch { /* Cleanup must not hide the original failure. */ }
+      if (destroyed || denied) throw new Error(SHARE_DENIED);
+      throw new Error(SHARE_UNAVAILABLE);
+    } finally { reader.releaseLock(); }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return bytes;
+  }
+  const mimeOf = response => (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  function checkedAsset(value, thumbnail = false) {
+    if (!value || !imageTypes.has(value.mime) || (thumbnail && value.mime !== 'image/jpeg')
+      || !Number.isInteger(value.size) || value.size < 1 || value.size > SHARE_MAX_IMAGE
+      || typeof value.sha256 !== 'string' || !safeHash.test(value.sha256)) throw new Error(SHARE_UNAVAILABLE);
+    // Paths from the snapshot are deliberately excluded: image requests use IDs only.
+    return {mime: value.mime, size: value.size, sha256: value.sha256};
+  }
+  function checkedSnapshot(data) {
+    if (data?.schema_version !== 1 || !Array.isArray(data.patients)
+      || !Array.isArray(data.visits) || !Array.isArray(data.attachments)) throw new Error(SHARE_UNAVAILABLE);
+    const patients = new Set();
+    for (const patient of data.patients) {
+      if (!['grandpa', 'grandma'].includes(patient?.id) || patients.has(patient.id)
+        || patient.name !== (patient.id === 'grandpa' ? '爺爺' : '嬷嬷')) throw new Error(SHARE_UNAVAILABLE);
+      patients.add(patient.id);
+    }
+    const files = new Map();
+    for (const file of data.attachments) {
+      if (!file || typeof file.id !== 'string' || !safeId.test(file.id) || files.has(file.id)
+        || !patients.has(file.patient_id) || file.privacy_checked !== true) throw new Error(SHARE_UNAVAILABLE);
+      files.set(file.id, {id: file.id, patient_id: file.patient_id, ...checkedAsset(file),
+        thumbnail: file.thumbnail === undefined ? null : checkedAsset(file.thumbnail, true)});
+    }
+    const visits = new Set();
+    const linked = new Set();
+    for (const visit of data.visits) {
+      if (!visit || typeof visit.id !== 'string' || !safeId.test(visit.id) || visits.has(visit.id)
+        || !patients.has(visit.patient_id) || visit.status !== 'confirmed'
+        || visit.privacy_reviewed !== true || !Array.isArray(visit.medicines)) throw new Error(SHARE_UNAVAILABLE);
+      visits.add(visit.id);
+      for (const sources of [visit.source_file_ids, ...visit.medicines.map(medicine => medicine?.source_file_ids)]) {
+        if (!Array.isArray(sources)) throw new Error(SHARE_UNAVAILABLE);
+        for (const id of sources) {
+          if (!files.has(id) || files.get(id).patient_id !== visit.patient_id) throw new Error(SHARE_UNAVAILABLE);
+          linked.add(id);
+        }
+      }
+    }
+    if (linked.size !== files.size) throw new Error(SHARE_UNAVAILABLE);
+    return files;
+  }
+
+  async function getData() {
+    requireEpoch(epoch);
+    const expected = ++epoch;
+    clearFiles();
+    const response = await request({action: 'snapshot'}, expected);
+    if (mimeOf(response) !== 'application/json') throw new Error(SHARE_UNAVAILABLE);
+    const bytes = await boundedBytes(response, SHARE_MAX_SNAPSHOT, expected);
+    let data;
+    try { data = JSON.parse(new TextDecoder('utf-8', {fatal: true}).decode(bytes)); }
+    catch { throw new Error(SHARE_UNAVAILABLE); }
+    const files = checkedSnapshot(data);
+    requireEpoch(expected);
+    availableFiles = files;
+    return data;
+  }
+
+  async function imageUrl(attachment, thumbnail) {
+    const expected = epoch;
+    requireEpoch(expected);
+    const file = availableFiles.get(attachment?.id);
+    if (!file) throw new Error(SHARE_UNAVAILABLE);
+    const asset = thumbnail && file.thumbnail ? file.thumbnail : file;
+    const key = `${file.id}:${thumbnail && file.thumbnail ? 'thumbnail' : 'original'}`;
+    if (blobUrls.has(key)) return blobUrls.get(key);
+    if (pendingImages.has(key)) return pendingImages.get(key);
+    const pending = (async () => {
+      const response = await request({action: 'file', attachmentId: file.id, thumbnail}, expected);
+      const mime = mimeOf(response);
+      if (!imageTypes.has(mime) || mime !== asset.mime) throw new Error(SHARE_UNAVAILABLE);
+      const bytes = await boundedBytes(response, SHARE_MAX_IMAGE, expected);
+      if (bytes.byteLength !== asset.size) throw new Error(SHARE_UNAVAILABLE);
+      let checksum;
+      try {
+        const digest = await crypto.subtle.digest('SHA-256', bytes);
+        checksum = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+      } catch { throw new Error(SHARE_UNAVAILABLE); }
+      requireEpoch(expected);
+      if (checksum !== asset.sha256) throw new Error(SHARE_UNAVAILABLE);
+      const url = URL.createObjectURL(new Blob([bytes], {type: mime}));
+      blobUrls.set(key, url);
+      return url;
+    })();
+    pendingImages.set(key, pending);
+    try { return await pending; }
+    finally { if (pendingImages.get(key) === pending) pendingImages.delete(key); }
+  }
+
+  return {
+    getData,
+    fileUrl(attachment) { return imageUrl(attachment, false); },
+    thumbnailUrl(attachment) { return imageUrl(attachment, true); },
+    destroy() {
+      destroyed = true;
+      capability = null;
+      ++epoch;
+      clearFiles();
+    },
+  };
+}
