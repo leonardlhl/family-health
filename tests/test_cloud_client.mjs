@@ -16,6 +16,8 @@ const config = { supabaseUrl: 'https://example.supabase.co', supabaseAnonKey: 's
 let permitted = false;
 let expireOnce = false;
 let refreshCount = 0;
+let thumbnailMode = false;
+let thumbnailPath = 'family/version1/photo.thumb.jpg';
 const session = () => ({ access_token: 'test-access', refresh_token: 'test-refresh', expires_in: 3600, user: { id: 'viewer', email: 'viewer@example.invalid' } });
 globalThis.fetch = async (url, options={}) => {
   requests.push({ url, method: options.method || 'GET' });
@@ -25,9 +27,11 @@ globalThis.fetch = async (url, options={}) => {
   if (expireOnce) { expireOnce=false; return response({}, 401); }
   if (url.includes('/family_archives?')) return response(permitted ? [{ id: 'family', current_version: 'version1', published_at: '2026-10-25' }] : []);
   if (url.includes('/family_snapshots?')) return response([{ published_at: '2026-10-25', snapshot: {
-    schema_version: 1, patients: [], visits: [], attachments: [{ id:'photo',privacy_checked:true,object_path:'family/version1/photo.png' }],
+    schema_version: 1, patients: [], visits: [], attachments: [{ id:'photo',privacy_checked:true,object_path:'family/version1/photo.png',
+      ...(thumbnailMode ? { thumbnail: { mime: 'image/jpeg', object_path: thumbnailPath, width: 960, height: 640 } } : {}),
+    }],
   } }]);
-  if (url.includes('/storage/')) return new Response(new Uint8Array([1,2,3]), { headers: { 'Content-Type': 'image/png' } });
+  if (url.includes('/storage/')) return new Response(new Uint8Array([1,2,3]), { headers: { 'Content-Type': url.endsWith('.thumb.jpg') ? 'image/jpeg' : 'image/png' } });
   throw new Error('Unexpected request');
 };
 const client = createCloudClient(config);
@@ -114,4 +118,26 @@ await versions.getData();
 releaseOldPhoto();
 await assert.rejects(oldPhoto, /紀錄已更新/);
 await versions.signOut();
-console.log('Cloud client: fail-closed, allowlist denial, refresh, private image scope, read-only requests, logout races and stale photo fences passed.');
+
+// Compressed previews and full-size images have independent, authenticated URLs.
+globalThis.fetch = normalFetch;
+thumbnailMode = true;
+const thumbnails = createCloudClient(config);
+await thumbnails.signIn('viewer@example.invalid', 'test');
+const thumbData = await thumbnails.getData();
+requests = [];
+const previewUrl = await thumbnails.thumbnailUrl(thumbData.attachments[0]);
+const fullUrl = await thumbnails.fileUrl(thumbData.attachments[0]);
+assert.notEqual(previewUrl, fullUrl);
+assert.equal(await thumbnails.thumbnailUrl(thumbData.attachments[0]), previewUrl);
+assert.equal(requests.filter(r => r.url.includes('/storage/')).length, 2);
+assert.ok(requests.some(r => r.url.endsWith('/photo.thumb.jpg')));
+assert.ok(requests.some(r => r.url.endsWith('/photo.png')));
+thumbnailPath = 'other/version1/private.thumb.jpg';
+const unsafeMetadata = await thumbnails.getData();
+requests = [];
+await thumbnails.thumbnailUrl(unsafeMetadata.attachments[0]);
+assert.equal(requests.some(r => r.url.includes('/other/')), false);
+assert.equal(requests.some(r => r.url.endsWith('/photo.png')), true);
+await thumbnails.signOut();
+console.log('Cloud client: auth/privacy/read-only/race checks and private compressed-preview/original separation passed.');

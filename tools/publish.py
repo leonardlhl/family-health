@@ -114,6 +114,7 @@ def prepare_snapshot(raw, archive_id, version_id):
                 raise PublishError("Invalid medication status.")
             for field in ("name", "strength", "dose", "frequency", "instructions"):
                 medicine[field] = _text(med.get(field, ""))
+            medicine["category"] = _text(med.get("category", ""), 80).strip()
             medicine["source_file_ids"] = check_sources(med.get("source_file_ids", []))
             visit["medicines"].append(medicine)
         appointment = item.get("appointment")
@@ -143,11 +144,27 @@ def prepare_snapshot(raw, archive_id, version_id):
         size = file.get("size")
         if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= 25 * 1024 * 1024:
             raise PublishError("Invalid source size.")
-        attachments.append({"id": file_id, "patient_id": file["patient_id"],
+        exported = {"id": file_id, "patient_id": file["patient_id"],
                             "archive_name": _text(file.get("archive_name", "相片"), 255),
                             "mime": mime, "size": size, "sha256": digest,
                             "privacy_checked": True, "status": "linked",
-                            "object_path": f"{archive_id}/{version_id}/{file_id}{MIME_EXT[mime]}"})
+                            "object_path": f"{archive_id}/{version_id}/{file_id}{MIME_EXT[mime]}"}
+        preview = file.get("thumbnail")
+        if preview is not None:
+            if not isinstance(preview, dict) or preview.get("mime") != "image/jpeg":
+                raise PublishError("Compressed previews must be metadata-free JPEG images.")
+            preview_digest = preview.get("sha256", "")
+            if not isinstance(preview_digest, str) or not re.fullmatch(r"[a-f0-9]{64}", preview_digest):
+                raise PublishError("Invalid compressed preview checksum.")
+            preview_size = preview.get("size")
+            if isinstance(preview_size, bool) or not isinstance(preview_size, int) or not 0 < preview_size <= 3 * 1024 * 1024:
+                raise PublishError("Invalid compressed preview size.")
+            dimensions = {field: preview.get(field) for field in ("width", "height")}
+            if any(isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 960 for value in dimensions.values()):
+                raise PublishError("Compressed preview dimensions must be at most 960 pixels.")
+            exported["thumbnail"] = {"mime": "image/jpeg", "size": preview_size, "sha256": preview_digest,
+                                     **dimensions, "object_path": f"{archive_id}/{version_id}/{file_id}.thumb.jpg"}
+        attachments.append(exported)
     return {"schema_version": 1, "patients": patients, "visits": visits, "attachments": attachments}
 
 
@@ -195,12 +212,20 @@ class SupabasePublisher:
             raise PublishError("Cannot connect to the private data service; the prior published version remains active.") from None
 
     def publish(self, snapshot, file_bytes, archive_id, version_id):
+        media = []
         for file in snapshot["attachments"]:
             content = file_bytes[file["id"]]
             path = "/storage/v1/object/family-health/" + quote(file["object_path"], safe="/")
             self.request(path, content, file["mime"])
+            media.append({"id": file["id"], "object_path": file["object_path"]})
+            if file.get("thumbnail"):
+                preview = file["thumbnail"]
+                preview_id = file["id"] + ":thumbnail"
+                path = "/storage/v1/object/family-health/" + quote(preview["object_path"], safe="/")
+                self.request(path, file_bytes[preview_id], preview["mime"])
+                media.append({"id": preview_id, "object_path": preview["object_path"]})
         payload = {"p_archive_id": archive_id, "p_version_id": str(version_id), "p_snapshot": snapshot,
-                   "p_media": [{"id": f["id"], "object_path": f["object_path"]} for f in snapshot["attachments"]]}
+                   "p_media": media}
         self.request("/rest/v1/rpc/publish_family_snapshot", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
 
 
@@ -211,13 +236,23 @@ def publish_archive(data_dir, dry_run=False):
     try:
         config = load_config(data_dir)
         version_id = str(uuid.uuid4())
-        snapshot = prepare_snapshot(store.confirmed_snapshot(), config["archive_id"], version_id)
+        raw = store.confirmed_snapshot()
+        # Derivatives are produced only after the store's confirmation/privacy boundary.
+        for source in raw["attachments"]:
+            source["thumbnail"] = store.thumbnail_info(source["id"])
+        snapshot = prepare_snapshot(raw, config["archive_id"], version_id)
         content = {}
         for file in snapshot["attachments"]:
             payload = store.attachment_path(file["id"]).read_bytes()
             if len(payload) != file["size"] or hashlib.sha256(payload).hexdigest() != file["sha256"]:
                 raise PublishError("A source image changed during publication. Please retry after finishing edits.")
             content[file["id"]] = payload
+            preview = file.get("thumbnail")
+            if preview:
+                payload = store.thumbnail_path(file["id"]).read_bytes()
+                if len(payload) != preview["size"] or hashlib.sha256(payload).hexdigest() != preview["sha256"]:
+                    raise PublishError("A compressed preview changed during publication. Please retry after finishing edits.")
+                content[file["id"] + ":thumbnail"] = payload
         result = {"visits": len(snapshot["visits"]), "attachments": len(snapshot["attachments"]), "dry_run": dry_run}
         if dry_run:
             return result

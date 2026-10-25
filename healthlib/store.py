@@ -24,12 +24,19 @@ SCHEMA_VERSION = 1
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
 MAX_BACKUP_BYTES = 512 * 1024 * 1024
 MAX_BACKUP_FILES = 5000
+THUMBNAIL_EDGE = 960
+THUMBNAIL_QUALITY = 86
+THUMBNAIL_VERSION = "v1"
 PATIENTS = {"grandpa": "爺爺", "grandma": "嬷嬷"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 
 
 class ValidationError(ValueError):
     pass
+
+
+class PrivacyReviewRequired(ValidationError):
+    """A preview must never be generated from an unreviewed source."""
 
 
 def now():
@@ -135,7 +142,7 @@ class HealthStore:
         self.data_dir = Path(data_dir).resolve()
         self.lock = threading.RLock()
         self.restore_tokens = {}
-        for folder in ("inbox/grandpa", "inbox/grandma", "staging", "archive", "backups", "exports", "restore"):
+        for folder in ("inbox/grandpa", "inbox/grandma", "staging", "archive", "backups", "exports", "restore", "previews"):
             target = self.data_dir / folder
             target.mkdir(parents=True, exist_ok=True)
             if not target.resolve().is_relative_to(self.data_dir):
@@ -316,6 +323,82 @@ class HealthStore:
         with self.lock:
             return self._public_attachment(self._get("attachments", item_id))
 
+    def _invalidate_thumbnails(self, item_id, keep=None):
+        # Only delete generated files belonging to this exact safe attachment ID.
+        if not isinstance(item_id, str) or not SAFE_ID.fullmatch(item_id):
+            raise ValidationError("相片編號格式錯誤")
+        cache_dir = (self.data_dir / "previews").resolve()
+        if not cache_dir.is_relative_to(self.data_dir):
+            raise ValidationError("預覽資料夾不能連結到檔案庫以外的位置")
+        for candidate in cache_dir.glob(item_id + "_*.jpg"):
+            resolved = candidate.resolve()
+            if candidate != keep and not candidate.is_symlink() and resolved.parent == cache_dir:
+                candidate.unlink(missing_ok=True)
+
+    def thumbnail_path(self, item_id):
+        """Return a small, anonymous derivative; archive pixels stay unchanged.
+
+        Source checksum is verified even for cache hits. A changed image must go
+        through the privacy review lifecycle before a new derivative is served.
+        """
+        with self.lock:
+            item = self._get("attachments", item_id)
+            if item.get("privacy_checked") is not True:
+                raise PrivacyReviewRequired("相片尚未完成私隱核對，暫不提供藥物預覽")
+            source_path = self.attachment_path(item_id)
+            archive_dir = (self.data_dir / "archive").resolve()
+            if item.get("mime") not in {"image/png", "image/jpeg", "image/webp"} or source_path.parent != archive_dir:
+                raise PrivacyReviewRequired("只可從已核對的歸檔相片建立預覽")
+            source_bytes = source_path.read_bytes()
+            checksum = digest(source_bytes)
+            if checksum != item.get("sha256"):
+                self._invalidate_thumbnails(item_id)
+                raise ValidationError("歸檔相片檢查碼不符，請重新核對相片")
+            cache_dir = self.data_dir / "previews"
+            if cache_dir.is_symlink() or getattr(cache_dir, "is_junction", lambda: False)() or not cache_dir.resolve().is_relative_to(self.data_dir):
+                raise ValidationError("預覽資料夾不能使用外部連結")
+            target = cache_dir / f"{item_id}_{checksum}_{THUMBNAIL_VERSION}_{THUMBNAIL_EDGE}_q{THUMBNAIL_QUALITY}.jpg"
+            if target.is_symlink() or target.resolve().parent != cache_dir.resolve():
+                raise ValidationError("預覽檔案路徑不安全")
+            if target.is_file():
+                try:
+                    with Image.open(target) as cached:
+                        if cached.format != "JPEG" or max(cached.size) > THUMBNAIL_EDGE or cached.getexif() or cached.info.get("comment"):
+                            raise ValueError("Invalid cached preview")
+                        cached.verify()
+                    return target
+                except (OSError, ValueError, Image.DecompressionBombError):
+                    target.unlink(missing_ok=True)
+            try:
+                with Image.open(io.BytesIO(source_bytes)) as source:
+                    oriented = ImageOps.exif_transpose(source)
+                    pixels = oriented.convert("RGB")
+                    pixels.thumbnail((THUMBNAIL_EDGE, THUMBNAIL_EDGE), Image.Resampling.LANCZOS)
+                    # New image guarantees no EXIF, text comments or profiles.
+                    clean = Image.new("RGB", pixels.size, "white")
+                    clean.paste(pixels)
+                    output = io.BytesIO()
+                    clean.save(output, format="JPEG", quality=THUMBNAIL_QUALITY, subsampling=0, optimize=True, progressive=True)
+                    encoded = output.getvalue()
+            except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                raise ValidationError("無法建立相片預覽，請檢查歸檔相片") from exc
+            temporary = target.with_name(target.name + "." + secrets.token_hex(4) + ".tmp")
+            try:
+                temporary.write_bytes(encoded)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            self._invalidate_thumbnails(item_id, keep=target)
+            return target
+
+    def thumbnail_info(self, item_id):
+        with self.lock:
+            path = self.thumbnail_path(item_id)
+            raw = path.read_bytes()
+            with Image.open(io.BytesIO(raw)) as image:
+                width, height = image.size
+            return {"mime": "image/jpeg", "sha256": digest(raw), "size": len(raw), "width": width, "height": height}
+
     def sanitize_attachment(self, item_id, raw, reviewed=False):
         if reviewed is not True:
             raise ValidationError("請先確認相片已遮蓋所有病人身份資料")
@@ -336,6 +419,7 @@ class HealthStore:
                     visit.update(status="draft", privacy_reviewed=False, reviewed_at=None, updated_at=now())
                     self._put("visits", visit)
             self.db.commit()
+            self._invalidate_thumbnails(item_id)
             if old_path != new_path and old_path.is_relative_to(self.data_dir):
                 old_path.unlink(missing_ok=True)
             return self._public_attachment(item)
@@ -377,6 +461,9 @@ class HealthStore:
             medicine = {"id": identifier(med.get("id"), "m_")}
             for field in ("name", "strength", "dose", "frequency", "instructions"):
                 medicine[field] = text(med.get(field))
+            # A label supplied and reviewed by the operator, never an inferred
+            # drug class or clinical recommendation.
+            medicine["category"] = text(med.get("category"), 80)
             medicine["status"] = med.get("status", "unknown")
             if medicine["status"] not in {"unknown", "current", "stopped"}:
                 raise ValidationError("服藥狀態格式錯誤")
@@ -471,6 +558,38 @@ class HealthStore:
             result["visits"] = visits
             result["attachments"] = [{**a, "original_name": "", "ocr_text": ""} for a in result["attachments"] if a["id"] in needed and a.get("privacy_checked")]
             return result
+
+    def family_data(self):
+        """Read-only local preview of exactly the reviewed family-facing data.
+
+        No files are generated and no local paths, operator-only review notes,
+        source filenames or OCR text cross this boundary.
+        """
+        with self.lock:
+            snapshot = self.confirmed_snapshot()
+
+            def selected(item, fields):
+                return {field: item[field] for field in fields if field in item}
+
+            patients = []
+            for patient in snapshot["patients"]:
+                if patient.get("id") in PATIENTS:
+                    patients.append({"id": patient["id"], "name": PATIENTS[patient["id"]], "age": patient.get("age"), "sex": patient.get("sex", "unknown")})
+            visits = []
+            for item in snapshot["visits"]:
+                visit = selected(item, ("id", "patient_id", "date", "doctor", "clinic", "reason", "diagnosis", "notes", "status", "privacy_reviewed", "created_at", "updated_at", "reviewed_at"))
+                visit["source_file_ids"] = list(item.get("source_file_ids", []))
+                visit["medicines"] = []
+                for med in item.get("medicines", []):
+                    medicine = selected(med, ("id", "name", "strength", "dose", "frequency", "instructions", "status"))
+                    medicine["category"] = text(med.get("category"), 80)
+                    medicine["source_file_ids"] = list(med.get("source_file_ids", []))
+                    visit["medicines"].append(medicine)
+                appointment = item.get("appointment")
+                visit["appointment"] = selected(appointment, ("date", "time", "location", "status", "notes")) if appointment else None
+                visits.append(visit)
+            attachments = [selected(item, ("id", "patient_id", "mime", "size", "sha256", "status", "privacy_checked")) for item in snapshot["attachments"]]
+            return {"schema_version": SCHEMA_VERSION, "patients": patients, "visits": visits, "attachments": attachments}
 
     def queue(self):
         with self.lock:

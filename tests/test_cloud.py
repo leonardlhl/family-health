@@ -69,8 +69,60 @@ class PublicationTests(unittest.TestCase):
         result = publish.prepare_snapshot(value, "family", VERSION)
         self.assertEqual([a["id"] for a in result["attachments"]], ["file1"])
 
+    def test_thumbnail_metadata_is_scoped_and_whitelisted(self):
+        value = example()
+        value["attachments"][0]["thumbnail"] = {"mime": "image/jpeg", "sha256": "b" * 64, "size": 100,
+                                                  "width": 960, "height": 640, "path": "PRIVATE", "patient_name": "PRIVATE"}
+        snapshot = publish.prepare_snapshot(value, "family", VERSION)
+        preview = snapshot["attachments"][0]["thumbnail"]
+        self.assertEqual(preview["object_path"], f"family/{VERSION}/file1.thumb.jpg")
+        self.assertNotIn("PRIVATE", json.dumps(snapshot))
+        self.assertTrue(snapshot["attachments"][0]["object_path"].endswith("file1.png"))
+        for change in ({"width": 961}, {"height": True}, {"mime": "image/png"}, {"sha256": "invalid"}):
+            invalid = copy.deepcopy(value); invalid["attachments"][0]["thumbnail"].update(change)
+            with self.assertRaises(publish.PublishError):
+                publish.prepare_snapshot(invalid, "family", VERSION)
+
+    def test_thumbnail_upload_is_in_same_atomic_publication(self):
+        value = example()
+        value["attachments"][0]["thumbnail"] = {"mime": "image/jpeg", "sha256": "b" * 64, "size": 100, "width": 960, "height": 640}
+        snapshot = publish.prepare_snapshot(value, "family", VERSION)
+        client = publish.SupabasePublisher("https://example.supabase.co", "sb_secret_test_only")
+        calls = []
+        client.request = lambda path, body, mime="application/json": calls.append((path, body, mime))
+        client.publish(snapshot, {"file1": b"original", "file1:thumbnail": b"preview"}, "family", VERSION)
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(calls[0][0].endswith("file1.png"))
+        self.assertTrue(calls[1][0].endswith("file1.thumb.jpg"))
+        self.assertEqual(calls[1][2], "image/jpeg")
+        payload = json.loads(calls[2][1])
+        self.assertEqual(len(payload["p_media"]), 2)
+        self.assertEqual(payload["p_media"][1]["id"], "file1:thumbnail")
+        calls.clear()
+        def fail_preview(path, body, mime="application/json"):
+            calls.append((path, body, mime))
+            if path.endswith(".thumb.jpg"): raise publish.PublishError("simulated preview upload failure")
+        client.request = fail_preview
+        with self.assertRaises(publish.PublishError):
+            client.publish(snapshot, {"file1": b"original", "file1:thumbnail": b"preview"}, "family", VERSION)
+        self.assertFalse(any("/rpc/" in call[0] for call in calls))
+
     def test_medication_sources_are_checked(self):
         value = example(); value["visits"][0]["medicines"] = [{"id": "med1", "source_file_ids": ["missing"]}]
+        with self.assertRaises(publish.PublishError):
+            publish.prepare_snapshot(value, "family", VERSION)
+
+    def test_medicine_category_preserves_confirmed_label_and_legacy_default(self):
+        value = example()
+        value["visits"][0]["medicines"] = [
+            {"id": "med1", "name": "測試藥名", "category": "  醫生確認分類  "},
+            {"id": "med2", "name": "舊紀錄測試"},
+        ]
+        result = publish.prepare_snapshot(value, "family", VERSION)
+        medicines = result["visits"][0]["medicines"]
+        self.assertEqual(medicines[0]["category"], "醫生確認分類")
+        self.assertEqual(medicines[1]["category"], "")
+        value["visits"][0]["medicines"][0]["category"] = "類" * 81
         with self.assertRaises(publish.PublishError):
             publish.prepare_snapshot(value, "family", VERSION)
 
@@ -141,6 +193,8 @@ class PublicationTests(unittest.TestCase):
             self.assertEqual(len(captured), 1)
             self.assertNotIn("identity-filename", json.dumps(captured[0]))
             self.assertEqual(captured[0]["visits"][0]["diagnosis"], "測試內容")
+            self.assertEqual(captured[0]["attachments"][0]["thumbnail"]["mime"], "image/jpeg")
+            self.assertLessEqual(captured[0]["attachments"][0]["thumbnail"]["width"], 960)
             store = HealthStore(folder)
             try: self.assertEqual(store.metadata("last_sync")["version_id"], result["version_id"])
             finally: store.close()

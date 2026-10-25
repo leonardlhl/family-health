@@ -1,1 +1,1 @@
-{"name":"family-health-ledger","version":"1.0.0","private":true,"type":"module","scripts":{"start":"python server.py","build":"python tools/build_site.py","test":"python -m unittest discover -s tests"}}
+{"name":"family-health-ledger","version":"1.1.0","private":true,"type":"module","scripts":{"start":"python server.py","build":"python tools/build_site.py","test":"python -m unittest discover -s tests && node tests/test_cloud_client.mjs && node --test tests/test_chapters.mjs"}}

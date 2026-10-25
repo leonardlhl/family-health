@@ -110,6 +110,24 @@ export function createCloudClient(config = {}) {
     if (!Array.isArray(rows) || rows.length !== 1) throw new Error('你未獲授權查看呢份紀錄，請聯絡管理人。');
     return rows[0];
   }
+  async function imageUrl(attachment, thumbnail = false) {
+    const epoch = authEpoch;
+    const sourceEpoch = fileEpoch;
+    const file = availableFiles.get(attachment?.id);
+    if (!file) throw new Error('相片未獲授權或未完成私隱檢查。');
+    const preview = thumbnail && file.thumbnail;
+    const asset = preview || file;
+    const cacheKey = `${file.id}:${preview ? 'thumbnail' : 'full'}`;
+    if (blobUrls.has(cacheKey)) return blobUrls.get(cacheKey);
+    const objectPath = asset.object_path.split('/').map(encodeURIComponent).join('/');
+    const response = await request(`/storage/v1/object/authenticated/family-health/${objectPath}`);
+    const blob = await response.blob();
+    requireEpoch(epoch);
+    if (sourceEpoch !== fileEpoch) throw new Error('紀錄已更新，請重新開啟相片。');
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(blob.type)) throw new Error('相片格式不受支援。');
+    if (preview && blob.type !== 'image/jpeg') throw new Error('預覽相片格式不受支援。');
+    const url = URL.createObjectURL(blob); blobUrls.set(cacheKey, url); return url;
+  }
   return {
     configured,
     async signIn(email, password) {
@@ -147,26 +165,17 @@ export function createCloudClient(config = {}) {
         throw new Error('紀錄格式未能讀取，請聯絡管理人。');
       }
       const prefix = `${archiveId}/${archive.current_version}/`;
+      const isScopedPath = path => typeof path === 'string' && path.startsWith(prefix) && !path.includes('..') && !path.includes('\\');
       for (const file of data.attachments) {
-        if (file.privacy_checked === true && typeof file.object_path === 'string' && file.object_path.startsWith(prefix)
-          && !file.object_path.includes('..') && !file.object_path.includes('\\')) availableFiles.set(file.id, file);
+        if (file.privacy_checked === true && isScopedPath(file.object_path)) {
+          const preview = file.thumbnail;
+          availableFiles.set(file.id, { ...file, thumbnail: preview?.mime === 'image/jpeg' && isScopedPath(preview.object_path) ? preview : null });
+        }
       }
       return { ...data, published_at: rows[0].published_at || archive.published_at };
     },
-    async fileUrl(attachment) {
-      const epoch = authEpoch;
-      const sourceEpoch = fileEpoch;
-      const file = availableFiles.get(attachment?.id);
-      if (!file) throw new Error('相片未獲授權或未完成私隱檢查。');
-      if (blobUrls.has(file.id)) return blobUrls.get(file.id);
-      const objectPath = file.object_path.split('/').map(encodeURIComponent).join('/');
-      const response = await request(`/storage/v1/object/authenticated/family-health/${objectPath}`);
-      const blob = await response.blob();
-      requireEpoch(epoch);
-      if (sourceEpoch !== fileEpoch) throw new Error('紀錄已更新，請重新開啟相片。');
-      if (!['image/png', 'image/jpeg', 'image/webp'].includes(blob.type)) throw new Error('相片格式不受支援。');
-      const url = URL.createObjectURL(blob); blobUrls.set(file.id, url); return url;
-    },
+    async fileUrl(attachment) { return imageUrl(attachment, false); },
+    async thumbnailUrl(attachment) { return imageUrl(attachment, true); },
     onAuthChange(callback) { listeners.add(callback); return () => listeners.delete(callback); },
     destroy() { clearFiles(); listeners.clear(); },
   };

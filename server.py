@@ -13,7 +13,7 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-from healthlib.store import HealthStore, ValidationError, decode_base64, MAX_BACKUP_BYTES
+from healthlib.store import HealthStore, ValidationError, PrivacyReviewRequired, decode_base64, MAX_BACKUP_BYTES
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
@@ -129,8 +129,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json_response({"app": APP_ID, "mode": "local", "csrf_token": self.server.csrf_token, "version": VERSION, "paths": {"inbox": str(self.store.data_dir / "inbox"), "archive": str(self.store.data_dir / "archive"), "backups": str(self.store.data_dir / "backups"), "import_folders": imports["folders"]}, "import_folder_warnings": imports["warnings"], "last_backup": self.store.metadata("last_backup"), "last_sync": self.store.metadata("last_sync"), "cloud": public_cloud_config(self.store)})
             if route == "/api/data":
                 return self.json_response(self.store.data())
+            if route == "/api/family-data":
+                return self.json_response(self.store.family_data())
             if route == "/api/queue":
                 return self.json_response(self.store.queue())
+            if route.startswith("/api/files/") and route.endswith("/thumbnail"):
+                file_id = route.removeprefix("/api/files/").removesuffix("/thumbnail")
+                return self.file_response(self.store.thumbnail_path(file_id), "image/jpeg")
             if route.startswith("/api/files/"):
                 file_id = route.removeprefix("/api/files/")
                 item = self.store.attachment(file_id)
@@ -143,6 +148,8 @@ class Handler(BaseHTTPRequestHandler):
             if not path.is_relative_to(WEB.resolve()) or not path.is_file() or path.is_symlink():
                 return self.json_response({"error": "找不到頁面"}, 404)
             return self.file_response(path)
+        except PrivacyReviewRequired as exc:
+            self.json_response({"error": str(exc)}, 403)
         except ValidationError as exc:
             self.json_response({"error": str(exc)}, 400)
         except OSError:

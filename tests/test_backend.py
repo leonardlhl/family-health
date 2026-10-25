@@ -125,6 +125,35 @@ class ArchiveTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.visit(appointment={"date": "2026-11-01", "time": "25:30"})
 
+    def test_medicine_category_roundtrips_backup_and_family_without_inference(self):
+        visit = self.visit(medicines=[{"id": "m_labeled", "name": "測試藥袋文字", "category": "  自訂分組  "}, {"id": "m_unlabeled", "name": "未分類測試藥袋"}])
+        self.assertEqual(visit["medicines"][0]["category"], "自訂分組")
+        self.assertEqual(visit["medicines"][1]["category"], "")
+        self.store.confirm_visit(visit["id"], reviewed=True)
+        family_meds = self.store.family_data()["visits"][0]["medicines"]
+        self.assertEqual([med["category"] for med in family_meds], ["自訂分組", ""])
+        backup = self.store.backup()
+        preview = self.store.restore_preview(Path(backup["path"]).read_bytes())
+        self.store.restore_apply(preview["token"])
+        restored = self.store.family_data()["visits"][0]["medicines"]
+        self.assertEqual([med["category"] for med in restored], ["自訂分組", ""])
+        for invalid in ({"unexpected": "object"}, "x" * 81):
+            with self.assertRaises(ValidationError):
+                self.visit(medicines=[{"name": "測試藥袋", "category": invalid}])
+
+    def test_family_data_defaults_legacy_category_without_writing_record(self):
+        visit = self.visit()
+        visit = self.store.confirm_visit(visit["id"], reviewed=True)
+        with self.store.lock:
+            legacy = self.store._get("visits", visit["id"])
+            legacy["medicines"][0].pop("category")
+            self.store._put("visits", legacy)
+            self.store.db.commit()
+        before = self.store.db.total_changes
+        self.assertEqual(self.store.family_data()["visits"][0]["medicines"][0]["category"], "")
+        self.assertEqual(self.store.db.total_changes, before)
+        self.assertNotIn("category", self.store.data()["visits"][0]["medicines"][0])
+
     def test_sanitize_discards_original_pixels_metadata_and_filename(self):
         original = self.store.upload("grandpa", "patient_name.png", picture(metadata=True))
         old_path = self.store.attachment_path(original["id"])
@@ -242,6 +271,50 @@ class HTTPTests(unittest.TestCase):
         _, bootstrap = self.request("GET", "/api/bootstrap")
         self.assertFalse(bootstrap["cloud"]["configured"])
         self.assertNotIn("sb_secret", json.dumps(bootstrap))
+
+    def test_family_endpoint_is_confirmed_only_exact_sources_and_pure_read(self):
+        first = self.store.upload("grandpa", "source-name.png", picture("white"))
+        second = self.store.upload("grandpa", "medicine-source.png", picture("black"))
+        unlinked = self.store.upload("grandpa", "unused.png", picture("red"))
+        pending = self.store.upload("grandma", "pending.png", picture("blue"))
+        for item in (first, second, unlinked):
+            self.store.review_attachment(item["id"], reviewed=True)
+        confirmed = self.store.upsert_visit({"patient_id": "grandpa", "date": "2026-10-25", "doctor": "陳醫生", "diagnosis": "醫生原文", "source_file_ids": [first["id"]], "medicines": [{"name": "測試藥袋文字", "category": "使用者分組", "source_file_ids": [second["id"]]}], "appointment": {"date": "2026-11-01", "time": "10:30", "location": "門診"}})
+        confirmed = self.store.confirm_visit(confirmed["id"], reviewed=True)
+        draft = self.store.upsert_visit({"patient_id": "grandma", "date": "2026-10-25", "doctor": "另一醫生", "diagnosis": "DRAFT_ONLY_TEXT", "source_file_ids": [pending["id"]]})
+        # Simulate extra operator-only metadata from a legacy source. The family
+        # view must use an allowlist instead of blindly returning the record.
+        with self.store.lock:
+            legacy = self.store._get("visits", confirmed["id"])
+            legacy["internal_path"] = "DO_NOT_EXPORT_INTERNAL_PATH"
+            self.store._put("visits", legacy)
+            self.store.db.commit()
+        before_data = self.store.data()
+        before_files = sorted(str(p.relative_to(self.temp.name)) for p in Path(self.temp.name).rglob("*") if p.is_file())
+        before_changes = self.store.db.total_changes
+        status, family = self.request("GET", "/api/family-data")
+        self.assertEqual(status, 200)
+        self.assertEqual(set(family), {"schema_version", "patients", "visits", "attachments"})
+        self.assertEqual([v["id"] for v in family["visits"]], [confirmed["id"]])
+        self.assertEqual({a["id"] for a in family["attachments"]}, {first["id"], second["id"]})
+        self.assertEqual(family["visits"][0]["diagnosis"], "醫生原文")
+        self.assertEqual(family["visits"][0]["appointment"]["time"], "10:30")
+        self.assertEqual(family["visits"][0]["medicines"][0]["source_file_ids"], [second["id"]])
+        self.assertEqual(family["visits"][0]["medicines"][0]["category"], "使用者分組")
+        for attachment in family["attachments"]:
+            for field in ("original_name", "archive_name", "ocr_text", "path", "source_sha256", "imported_at"):
+                self.assertNotIn(field, attachment)
+        serialized = json.dumps(family)
+        self.assertNotIn("DRAFT_ONLY_TEXT", serialized)
+        self.assertNotIn("DO_NOT_EXPORT", serialized)
+        self.assertNotIn("review_notes", serialized)
+        self.assertEqual(self.store.data(), before_data)
+        self.assertEqual(self.store.db.total_changes, before_changes)
+        self.assertEqual(sorted(str(p.relative_to(self.temp.name)) for p in Path(self.temp.name).rglob("*") if p.is_file()), before_files)
+        self.assertEqual(self.request("GET", "/api/family-data", headers={"Origin": "https://evil.example"})[0], 403)
+        status, operator = self.request("GET", "/api/data")
+        self.assertEqual(status, 200)
+        self.assertIn(draft["id"], {v["id"] for v in operator["visits"]})
 
     def test_paths_cannot_read_private_database(self):
         for path in ("/../private/archive.sqlite3", "/%2e%2e/private/archive.sqlite3", "/api/backups/../archive.sqlite3"):

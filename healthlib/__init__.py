@@ -1,5 +1,5 @@
 """Local, privacy-reviewed family health archive."""
 
-from .store import HealthStore, ValidationError
+from .store import HealthStore, ValidationError, PrivacyReviewRequired
 
-__all__ = ["HealthStore", "ValidationError"]
+__all__ = ["HealthStore", "ValidationError", "PrivacyReviewRequired"]

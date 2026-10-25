@@ -1,4 +1,4 @@
-param([switch]$NoBrowser)
+﻿param([switch]$NoBrowser, [ValidateSet('manage','family')][string]$View = 'manage')
 $ErrorActionPreference = 'Stop'
 $projectDirectory = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $dataDirectory = Join-Path $projectDirectory 'private'
@@ -30,7 +30,7 @@ try {
     $initial = Get-ArchiveStatus
     if ($initial.reachable) {
         Assert-OurArchive $initial
-        if (-not $NoBrowser) { Start-Process $baseUrl }
+        if (-not $NoBrowser) { Start-Process "$baseUrl/?view=$View" }
         Write-Host "Family Health is already running: $baseUrl"
         exit 0
     }
@@ -83,7 +83,7 @@ try {
         Start-Sleep -Milliseconds 350
     }
     if (-not $healthy) { throw "The server did not become ready. See $stderrPath" }
-    if (-not $NoBrowser) { Start-Process $baseUrl }
+    if (-not $NoBrowser) { Start-Process "$baseUrl/?view=$View" }
     Write-Host "Family Health is ready: $baseUrl"
 } catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
