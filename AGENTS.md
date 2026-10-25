@@ -35,3 +35,7 @@
 伺服器只綁定本機地址；不能為方便家人使用而直接開放管理 API 到區域網絡或互聯網。GitHub Pages 只託管空介面，雲端身份及相片權限依部署文件配置。不要把管理密鑰寫入 `web/`、Git、建置結果或輸出日誌。
 
 完成修改後執行相應測試，報告已通過的檢查及尚未完成的真實環境驗證。不要聲稱未測過的雲端權限、完整還原或圖片識別已成功。
+
+## 本機正式安裝位置
+
+正式程式與資料位於 `D:\Medical\FamilyHealth`，主檔為該目錄下 `private/archive.sqlite3`。本工作區的同名專案是開發來源；不要在開發來源建立另一份正式病歷。整理新相前先檢查 localhost:8767 的 bootstrap，確認 inbox 路徑位於 D:\Medical\FamilyHealth。現有外部收相資料夾由正式安裝的 private/import-folders.json 明確列出。所有正式操作應使用正式安裝的工具／API。
