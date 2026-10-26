@@ -39,7 +39,7 @@ function harness({mode='share',view='family',demo=false}={}){
   const json=payload=>({ok:true,json:async()=>payload});
   let respond=async url=>url==='/api/medicine-feedback'?json({items:remoteItems,stale:false}):
     ['/api/data','/api/family-data'].includes(url)?json(fixture()):Promise.reject(Error('Unexpected synthetic request'));
-  const document={documentElement:{lang:''},title:'',querySelector:s=>nodes.get(s)||null,
+  const document={documentElement:{lang:'',dataset:{}},title:'',querySelector:s=>nodes.get(s)||null,
     querySelectorAll:s=>s==='.feedback-slot'?slots:[],addEventListener:(name,callback)=>events.set(name,callback)};
   const context=vm.createContext({document,location:{hostname:'localhost',search:'',hash:'',pathname:'/'},
     window:{addEventListener:(name,callback)=>windowEvents.set(name,callback),scrollTo(){}},URL,URLSearchParams,Intl,Date,Math,Map,Set,

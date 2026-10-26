@@ -57,7 +57,7 @@ function harness(){
     if(url==='/api/data'||url==='/api/family-data')return json(fixture());
     throw Error('Unexpected network request in a synthetic test');
   };
-  const document={documentElement:{lang:''},title:'',querySelector:s=>nodes.get(s)||null,
+  const document={documentElement:{lang:'',dataset:{}},title:'',querySelector:s=>nodes.get(s)||null,
     querySelectorAll:()=>[],addEventListener:(name,callback)=>events.set(name,callback)};
   const context=vm.createContext({document,location:{hostname:'localhost',search:'',hash:'',pathname:'/'},
     window:{addEventListener(){},scrollTo(){},open(){}},URL,URLSearchParams,Intl,Date,Math,Map,Set,

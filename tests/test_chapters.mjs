@@ -20,7 +20,7 @@ function harness({hostname='localhost',search='',hash=''}={}){
     open:false,disabled:false,close(){this.open=false;},showModal(){this.open=true;},
     addEventListener(){},querySelector:selector=>nodes.get(selector)||null,...extra});
   for(const key of ['#app','#workspace','#page-body','#medicine-categories','#toast','#dialog','.dialog-body'])nodes.set(key,makeNode());
-  const document={documentElement:{lang:''},title:'',querySelector:selector=>nodes.get(selector)||null,
+  const document={documentElement:{lang:'',dataset:{}},title:'',querySelector:selector=>nodes.get(selector)||null,
     querySelectorAll:()=>[],addEventListener:(name,callback)=>events.set(name,callback)};
   let respond=async()=>{throw Error('Unexpected network access in a synthetic test');};
   const client={getSession:async()=>null,onAuthChange:()=>()=>{},destroy(){},getData:async()=>fixture()};
