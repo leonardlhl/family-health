@@ -21,7 +21,19 @@ const MAX_PREVIEW = 3 * 1024 * 1024;
 
 class Denied extends Error {}
 class Unavailable extends Error {}
+class InvalidFeedback extends Error {}
 const requireAccess = condition => { if (!condition) throw new Denied(); };
+
+function publicFeedback(value) {
+  if (!value || !UUID.test(value.id) || !Object.hasOwn(ALIASES,value.patient_id)
+    || !ID.test(value.visit_id) || !ID.test(value.medicine_id)
+    || !['effective','ineffective','undecided'].includes(value.rating)
+    || typeof value.notes !== 'string' || [...value.notes].length > 500
+    || !Number.isInteger(value.revision) || value.revision < 1
+    || typeof value.created_at !== 'string' || !Number.isFinite(Date.parse(value.created_at))) throw new Unavailable();
+  return Object.fromEntries(['id','patient_id','visit_id','medicine_id','rating','notes','revision','created_at']
+    .map(key => [key,value[key]]));
+}
 
 async function boundedBytes(value, limit) {
   const length = value.headers.get('content-length');
@@ -132,9 +144,9 @@ export function createHandler(options = {}) {
       const method = request.headers.get('access-control-request-method');
       const headers = (request.headers.get('access-control-request-headers') || '')
         .split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
-      if (method !== 'POST' || headers.some(value => value !== 'content-type')) return jsonResponse({error:DENIED}, 403, origin);
+      if (method !== 'POST' || headers.some(value => !['content-type','authorization'].includes(value))) return jsonResponse({error:DENIED}, 403, origin);
       return response(null, 204, origin, {'Access-Control-Allow-Methods':'POST, OPTIONS',
-        'Access-Control-Allow-Headers':'content-type'});
+        'Access-Control-Allow-Headers':'content-type, authorization'});
     }
     if (request.method !== 'POST') return jsonResponse({error:DENIED}, 405, origin);
     try {
@@ -144,10 +156,29 @@ export function createHandler(options = {}) {
       try { body = JSON.parse(new TextDecoder('utf-8', {fatal:true}).decode(await boundedBytes(request, MAX_BODY))); }
       catch { throw new Denied(); }
       requireAccess(body && !Array.isArray(body) && typeof body === 'object'
-        && typeof body.token === 'string' && /^[A-Za-z0-9_-]{43}$/.test(body.token)
-        && ['snapshot','file'].includes(body.action));
-      const permittedKeys = body.action === 'file' ? ['token','action','attachmentId','thumbnail'] : ['token','action'];
-      requireAccess(Object.keys(body).every(key => permittedKeys.includes(key)));
+        && ['snapshot','file','feedback-list','feedback-save'].includes(body.action));
+      const feedback = body.action.startsWith('feedback-');
+      const authorization = request.headers.get('authorization');
+      const hasToken = body.token !== undefined;
+      requireAccess(hasToken ? typeof body.token === 'string' && /^[A-Za-z0-9_-]{43}$/.test(body.token)
+        && !authorization : feedback && typeof authorization === 'string'
+        && authorization.length <= 8192 && /^Bearer [A-Za-z0-9._-]+$/i.test(authorization));
+      const feedbackFields = ['patient_id','visit_id','medicine_id','rating','notes','expected_revision','request_id','snapshot_version'];
+      const permittedKeys = ['token','action',...(body.action === 'file' ? ['attachmentId','thumbnail']
+        : body.action === 'feedback-save' ? feedbackFields : [])];
+      if (!Object.keys(body).every(key => permittedKeys.includes(key))) {
+        if (feedback) throw new InvalidFeedback();
+        throw new Denied();
+      }
+      if (body.action === 'feedback-save' && (!Object.hasOwn(ALIASES,body.patient_id)
+        || typeof body.visit_id !== 'string' || !ID.test(body.visit_id)
+        || typeof body.medicine_id !== 'string' || !ID.test(body.medicine_id)
+        || !['effective','ineffective','undecided'].includes(body.rating)
+        || typeof body.notes !== 'string' || [...body.notes].length > 500
+        || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(body.notes)
+        || !Number.isInteger(body.expected_revision) || body.expected_revision < 0 || body.expected_revision >= 2147483647
+        || typeof body.request_id !== 'string' || !UUID.test(body.request_id)
+        || typeof body.snapshot_version !== 'string' || !UUID.test(body.snapshot_version))) throw new InvalidFeedback();
       if (body.action === 'file') requireAccess(typeof body.attachmentId === 'string' && ID.test(body.attachmentId)
         && (body.thumbnail === undefined || typeof body.thumbnail === 'boolean'));
 
@@ -164,7 +195,47 @@ export function createHandler(options = {}) {
       }
       const digest = async bytes => Array.from(new Uint8Array(await cryptography.subtle.digest('SHA-256', bytes)))
         .map(byte => byte.toString(16).padStart(2,'0')).join('');
-      const tokenHash = await digest(new TextEncoder().encode(body.token));
+      const tokenHash = hasToken ? await digest(new TextEncoder().encode(body.token)) : null;
+      if (feedback) {
+        let userId = null;
+        if (!hasToken) {
+          let auth;
+          try { auth = await send(base + '/auth/v1/user', {method:'GET',headers:{apikey:secret,Authorization:authorization},
+            cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000)}); }
+          catch { throw new Unavailable(); }
+          if ([401,403].includes(auth.status)) throw new Denied();
+          if (!auth.ok) throw new Unavailable();
+          let user;
+          try { user = JSON.parse(new TextDecoder().decode(await boundedBytes(auth,65536))); }
+          catch { throw new Unavailable(); }
+          requireAccess(typeof user.id === 'string' && UUID.test(user.id) && user.is_anonymous !== true);
+          userId = user.id;
+        }
+        const payload = {p_action:body.action === 'feedback-list' ? 'list' : 'save',
+          p_token_hash:tokenHash,p_user_id:userId,p_archive_id:'family'};
+        if (body.action === 'feedback-save') for (const field of feedbackFields) payload[`p_${field}`] = body[field];
+        let result;
+        try { result = await send(base + '/rest/v1/rpc/family_medicine_feedback_access', {
+          method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify(payload),
+          cache:'no-store',credentials:'omit',redirect:'error',signal:AbortSignal.timeout(15000)}); }
+        catch { throw new Unavailable(); }
+        if (!result.ok) throw new Unavailable();
+        let value;
+        try { value = JSON.parse(new TextDecoder().decode(await boundedBytes(result,MAX_SNAPSHOT))); }
+        catch { throw new Unavailable(); }
+        if (value?.status === 'denied') throw new Denied();
+        if (value?.status === 'invalid') throw new InvalidFeedback();
+        if (value?.status === 'rate_limited') return jsonResponse({error:'feedback_rate_limited'},429,origin);
+        if (value?.status === 'stale') return jsonResponse({error:'feedback_stale',item:null},409,origin);
+        if (value?.status === 'conflict') return jsonResponse({error:'feedback_conflict',
+          item:value.item === null ? null : publicFeedback(value.item)},409,origin);
+        if (value?.status !== 'ok') throw new Unavailable();
+        if (body.action === 'feedback-list') {
+          if (!Array.isArray(value.items)) throw new Unavailable();
+          return jsonResponse({items:value.items.map(publicFeedback)},200,origin);
+        }
+        return jsonResponse({item:publicFeedback(value.item)},200,origin);
+      }
       const upstream = async path => {
         let result;
         try { result = await send(base + path, {method:'GET', headers, cache:'no-store',
@@ -217,7 +288,7 @@ export function createHandler(options = {}) {
       };
       if (body.action === 'snapshot') {
         await recheck();
-        return jsonResponse({...snapshot,published_at:publishedAt || null}, 200, origin);
+        return jsonResponse({...snapshot,published_at:publishedAt || null,snapshot_version:archive.current_version}, 200, origin);
       }
       const file = snapshot.attachments.find(item => item.id === body.attachmentId);
       // A previously displayed attachment can disappear after publication.
@@ -241,6 +312,7 @@ export function createHandler(options = {}) {
       return response(bytes, 200, origin, {'Content-Type':asset.mime,
         'Content-Disposition':`inline; filename="image${EXTENSIONS[asset.mime]}"`});
     } catch (error) {
+      if (error instanceof InvalidFeedback) return jsonResponse({error:'feedback_invalid'},400,origin);
       return jsonResponse({error:error instanceof Denied ? DENIED : 'Private records are temporarily unavailable.'},
         error instanceof Denied ? 403 : 503, origin);
     }

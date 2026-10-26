@@ -1,4 +1,82 @@
-/** Authenticated, read-only family client. No records are persisted in browser storage. */
+const FEEDBACK_UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+const FEEDBACK_ID = /^[A-Za-z0-9_-]{1,96}$/;
+function feedbackError(status, code, item = null) {
+  const message = code === 'feedback_conflict' ? '其他家人已更新回饋，請先查看最新內容。'
+    : code === 'feedback_stale' ? '藥單已更新，請重新整理後再填回饋。'
+    : code === 'feedback_invalid' ? '請選擇效果，備註最多 500 字。'
+    : code === 'feedback_rate_limited' ? '回饋提交得太密，請等一分鐘再試。'
+    : '暫時未能讀取或儲存回饋，請稍後再試。';
+  const error = new Error(message);
+  error.status = status; error.code = code; error.item = item;
+  return error;
+}
+function feedbackPayload(value, snapshotVersion) {
+  const fields = ['patient_id','visit_id','medicine_id','rating','notes','expected_revision','request_id'];
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !Object.keys(value).every(key => fields.includes(key))
+    || !['grandpa','grandma'].includes(value.patient_id)
+    || typeof value.visit_id !== 'string' || !FEEDBACK_ID.test(value.visit_id)
+    || typeof value.medicine_id !== 'string' || !FEEDBACK_ID.test(value.medicine_id)
+    || !['effective','ineffective','undecided'].includes(value.rating)
+    || typeof value.notes !== 'string' || [...value.notes].length > 500
+    || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(value.notes)
+    || !Number.isInteger(value.expected_revision) || value.expected_revision < 0 || value.expected_revision >= 2147483647
+    || typeof value.request_id !== 'string' || !FEEDBACK_UUID.test(value.request_id)) throw feedbackError(400,'feedback_invalid');
+  if (typeof snapshotVersion !== 'string' || !FEEDBACK_UUID.test(snapshotVersion)) throw feedbackError(409,'feedback_stale');
+  return {...Object.fromEntries(fields.map(key => [key,value[key]])),snapshot_version:snapshotVersion};
+}
+function feedbackItem(value) {
+  if (!value || typeof value.id !== 'string' || !FEEDBACK_UUID.test(value.id)
+    || !['grandpa','grandma'].includes(value.patient_id)
+    || typeof value.visit_id !== 'string' || !FEEDBACK_ID.test(value.visit_id)
+    || typeof value.medicine_id !== 'string' || !FEEDBACK_ID.test(value.medicine_id)
+    || !['effective','ineffective','undecided'].includes(value.rating)
+    || typeof value.notes !== 'string' || [...value.notes].length > 500
+    || !Number.isInteger(value.revision) || value.revision < 1
+    || typeof value.created_at !== 'string' || !Number.isFinite(Date.parse(value.created_at))) throw feedbackError(null,'feedback_unavailable');
+  return Object.fromEntries(['id','patient_id','visit_id','medicine_id','rating','notes','revision','created_at'].map(key => [key,value[key]]));
+}
+function rememberedFeedback(value, snapshotVersion, requests) {
+  const previous = requests.get(value?.request_id?.toLowerCase?.());
+  const payload = feedbackPayload(value,previous?.snapshot_version || snapshotVersion);
+  payload.request_id = payload.request_id.toLowerCase();
+  if (previous && JSON.stringify(previous) !== JSON.stringify(payload)) throw feedbackError(400,'feedback_invalid');
+  if (!previous) requests.set(payload.request_id,payload);
+  return payload;
+}
+async function feedbackResponse(response, requireCurrent, action) {
+  const limit = 16 * 1024 * 1024;
+  const declared = response.headers.get('content-length');
+  if (!response.body || (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase() !== 'application/json'
+    || (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > limit))) throw feedbackError(null,'feedback_unavailable');
+  const reader = response.body.getReader(), chunks = []; let size = 0;
+  try {
+    while (true) {
+      const result = await reader.read(); requireCurrent();
+      if (result.done) break;
+      size += result.value.byteLength;
+      if (size > limit) throw feedbackError(null,'feedback_unavailable');
+      chunks.push(result.value);
+    }
+  } catch (error) { try { await reader.cancel(); } catch {} throw error; }
+  finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(size); let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk,offset); offset += chunk.byteLength; }
+  let value; try { value = JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes)); }
+  catch { throw feedbackError(null,'feedback_unavailable'); }
+  requireCurrent();
+  if (!response.ok) {
+    const code = response.status === 409 && ['feedback_conflict','feedback_stale'].includes(value?.error) ? value.error
+      : response.status === 400 ? 'feedback_invalid'
+      : response.status === 429 ? 'feedback_rate_limited' : 'feedback_unavailable';
+    throw feedbackError(response.status,code,code === 'feedback_conflict' && value.item ? feedbackItem(value.item) : null);
+  }
+  if (action === 'feedback-list' && Array.isArray(value?.items)) return {items:value.items.map(feedbackItem)};
+  if (action === 'feedback-save' && value?.item) return {item:feedbackItem(value.item)};
+  throw feedbackError(null,'feedback_unavailable');
+}
+
+/** Clinical data is read-only; separate family observations use scoped feedback actions. */
 export function createCloudClient(config = {}) {
   const base = String(config.supabaseUrl || '').replace(/\/$/, '');
   const key = String(config.supabaseAnonKey || '');
@@ -20,6 +98,8 @@ export function createCloudClient(config = {}) {
   let authEpoch = 0;
   let fileEpoch = 0;
   let availableFiles = new Map();
+  let snapshotVersion = null;
+  const feedbackRequests = new Map();
   try { session = JSON.parse(sessionStorage.getItem(storageKey) || 'null'); } catch { /* storage unavailable */ }
   function ensureConfigured() {
     if (!configured) throw new Error('家人網站尚未連接私人資料庫，請聯絡管理人。');
@@ -31,6 +111,7 @@ export function createCloudClient(config = {}) {
     ++fileEpoch;
     for (const url of blobUrls.values()) URL.revokeObjectURL(url);
     blobUrls.clear(); availableFiles.clear();
+    snapshotVersion = null;
   }
   function saveSession(value) {
     session = value;
@@ -38,7 +119,7 @@ export function createCloudClient(config = {}) {
       if (value) sessionStorage.setItem(storageKey, JSON.stringify(value));
       else sessionStorage.removeItem(storageKey);
     } catch { /* memory-only sessions still work */ }
-    if (!value) clearFiles();
+    if (!value) { clearFiles(); feedbackRequests.clear(); }
     for (const fn of listeners) { try { fn(value); } catch { /* one listener cannot break auth */ } }
   }
   function normalizedSession(value) {
@@ -159,6 +240,27 @@ export function createCloudClient(config = {}) {
     if (sourceEpoch !== fileEpoch) throw new Error('紀錄已更新，請重新開啟相片。');
     const url = URL.createObjectURL(new Blob([bytes], {type:mime})); blobUrls.set(cacheKey, url); return url;
   }
+  async function feedbackRequest(action, value) {
+    const epoch = authEpoch, generation = fileEpoch;
+    const payload = {action,...(action === 'feedback-save' ? rememberedFeedback(value,snapshotVersion,feedbackRequests) : {})};
+    const check = () => {
+      requireEpoch(epoch);
+      if (generation !== fileEpoch) throw feedbackError(null,'feedback_unavailable');
+    };
+    const active = await currentSession(); check();
+    if (!active) throw feedbackError(403,'feedback_unavailable');
+    let response;
+    try { response = await fetch(base + '/functions/v1/family-share', {
+      method:'POST',cache:'no-store',credentials:'omit',redirect:'error',referrerPolicy:'no-referrer',
+      headers:{'Content-Type':'application/json',Authorization:`Bearer ${active.access_token}`},body:JSON.stringify(payload),
+    }); } catch { throw feedbackError(null,'feedback_unavailable'); }
+    check();
+    if ([401,403].includes(response.status)) {
+      ++authEpoch; refreshPromise = null; saveSession(null);
+      throw feedbackError(response.status,'feedback_denied');
+    }
+    return feedbackResponse(response,check,action);
+  }
   return {
     configured,
     async signIn(email, password) {
@@ -216,12 +318,16 @@ export function createCloudClient(config = {}) {
           availableFiles.set(file.id, { ...file, thumbnail: preview?.mime === 'image/jpeg' && isScopedPath(preview,file,true) ? preview : null });
         }
       }
-      return { ...data, reports:data.reports || [], published_at: rows[0].published_at || archive.published_at };
+      snapshotVersion = archive.current_version;
+      return { ...data, reports:data.reports || [], published_at: rows[0].published_at || archive.published_at,
+        snapshot_version:snapshotVersion };
     },
+    getFeedback() { return feedbackRequest('feedback-list'); },
+    saveFeedback(value) { return feedbackRequest('feedback-save',value); },
     async fileUrl(attachment) { return imageUrl(attachment, false); },
     async thumbnailUrl(attachment) { return imageUrl(attachment, true); },
     onAuthChange(callback) { listeners.add(callback); return () => listeners.delete(callback); },
-    destroy() { clearFiles(); listeners.clear(); },
+    destroy() { clearFiles(); feedbackRequests.clear(); listeners.clear(); },
   };
 }
 
@@ -241,7 +347,7 @@ export function readShareToken(hash) {
   return values[0];
 }
 
-/** Read-only capability client; the token exists only in this instance's memory. */
+/** Scoped capability client; the token exists only in this instance's memory. */
 export function createShareClient(config, token, {onDenied} = {}) {
   const base = String(config?.supabaseUrl || '').replace(/\/$/, '');
   if (!/^https:\/\/[a-z0-9-]+\.supabase\.co$/.test(base)) {
@@ -255,6 +361,8 @@ export function createShareClient(config, token, {onDenied} = {}) {
   let destroyed = false;
   let denied = false;
   let availableFiles = new Map();
+  let snapshotVersion = null;
+  const feedbackRequests = new Map();
   const blobUrls = new Map();
   const pendingImages = new Map();
   const safeId = /^[A-Za-z0-9_-]{1,96}$/;
@@ -266,6 +374,7 @@ export function createShareClient(config, token, {onDenied} = {}) {
     blobUrls.clear();
     pendingImages.clear();
     availableFiles.clear();
+    snapshotVersion = null;
   }
   function requireEpoch(expected) {
     if (destroyed || denied || !capability) throw new Error(SHARE_DENIED);
@@ -275,6 +384,7 @@ export function createShareClient(config, token, {onDenied} = {}) {
     if (destroyed || denied) return;
     denied = true;
     capability = null;
+    feedbackRequests.clear();
     ++epoch;
     clearFiles();
     if (typeof onDenied === 'function') {
@@ -290,13 +400,18 @@ export function createShareClient(config, token, {onDenied} = {}) {
         referrerPolicy: 'no-referrer', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({token: capability, ...payload}),
       });
-    } catch { throw new Error(SHARE_UNAVAILABLE); }
+    } catch {
+      if (payload.action.startsWith('feedback-')) throw feedbackError(null,'feedback_unavailable');
+      throw new Error(SHARE_UNAVAILABLE);
+    }
     if (response.status === 403) {
       denyAccess();
-      throw new Error(SHARE_DENIED);
+      const error = new Error(SHARE_DENIED);
+      if (payload.action.startsWith('feedback-')) { error.status = 403; error.code = 'feedback_denied'; }
+      throw error;
     }
     requireEpoch(expected);
-    if (!response.ok) throw new Error(SHARE_UNAVAILABLE);
+    if (!response.ok && !payload.action.startsWith('feedback-')) throw new Error(SHARE_UNAVAILABLE);
     return response;
   }
   async function boundedBytes(response, limit, expected) {
@@ -400,6 +515,7 @@ export function createShareClient(config, token, {onDenied} = {}) {
     const files = checkedSnapshot(data);
     requireEpoch(expected);
     availableFiles = files;
+    snapshotVersion = data.snapshot_version || null;
     return {...data,reports:data.reports || []};
   }
 
@@ -436,11 +552,23 @@ export function createShareClient(config, token, {onDenied} = {}) {
 
   return {
     getData,
+    async getFeedback() {
+      const expected = epoch;
+      const response = await request({action:'feedback-list'},expected);
+      return feedbackResponse(response,() => requireEpoch(expected),'feedback-list');
+    },
+    async saveFeedback(value) {
+      const expected = epoch;
+      const payload = rememberedFeedback(value,snapshotVersion,feedbackRequests);
+      const response = await request({action:'feedback-save',...payload},expected);
+      return feedbackResponse(response,() => requireEpoch(expected),'feedback-save');
+    },
     fileUrl(attachment) { return imageUrl(attachment, false); },
     thumbnailUrl(attachment) { return imageUrl(attachment, true); },
     destroy() {
       destroyed = true;
       capability = null;
+      feedbackRequests.clear();
       ++epoch;
       clearFiles();
     },

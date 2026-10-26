@@ -125,7 +125,7 @@ test('medicines share one date section per day in descending order with unknown 
   h.ui.state.data.visits=[dated('old','2026-10-01','MED_OLD'),dated('new-one','2026-10-25','MED_NEW_ONE'),
     dated('undated',null,'MED_UNDATED'),dated('middle','2026-10-10','MED_MIDDLE'),
     dated('new-two','2026-10-25','MED_NEW_TWO'),h.ui.state.data.visits[1]];
-  const groups=[...h.ui.medicineList().matchAll(/<section class="medicine-date-group" data-date="([^"]*)">([\s\S]*?)<\/section>/g)];
+  const groups=[...h.ui.medicineList().matchAll(/<section class="medicine-date-group" data-date="([^"]*)">([\s\S]*?)(?=<section class="medicine-date-group"|$)/g)];
   assert.deepEqual(groups.map(group=>group[1]),['2026-10-25','2026-10-10','2026-10-01','']);
   assert.match(groups[0][2],/MED_NEW_ONE/);assert.match(groups[0][2],/MED_NEW_TWO/);
   assert.doesNotMatch(groups[0][2],/MED_OLD|MED_MIDDLE|GRANDMA_MED/);
@@ -222,8 +222,8 @@ test('raw medicine photos stay hidden and cannot open from a family view',async(
 
 test('family preview reads the safe endpoint and management reads its own endpoint',async()=>{
   const h=harness();h.setResponse(()=>h.json(fixture()));
-  h.ui.state.view='family';await h.ui.loadData();assert.equal(h.requests.at(-1).url,'/api/family-data');
-  h.ui.state.view='manage';await h.ui.loadData();assert.equal(h.requests.at(-1).url,'/api/data');
+  h.ui.state.view='family';await h.ui.loadData();assert.equal(h.requests.filter(r=>['/api/data','/api/family-data'].includes(r.url)).at(-1).url,'/api/family-data');
+  h.ui.state.view='manage';await h.ui.loadData();assert.equal(h.requests.filter(r=>['/api/data','/api/family-data'].includes(r.url)).at(-1).url,'/api/data');
 });
 
 test('family views render no upload, settings, editing or confirmation controls',()=>{

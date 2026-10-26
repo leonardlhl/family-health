@@ -18,7 +18,7 @@ from tools.share import ShareManager, ShareError
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_ID = "family-health"
 
 
@@ -47,7 +47,7 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FamilyHealth/1.2"
+    server_version = "FamilyHealth/1.3"
 
     def log_message(self, fmt, *args):
         # Request URLs can contain medical record identifiers. No access log.
@@ -147,6 +147,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 from tools.storage import storage_status
                 return self.json_response(storage_status(self.store.data_dir))
+            if route == "/api/medicine-feedback":
+                if not self.guard(mutate=True):
+                    return
+                from tools.feedback import refresh_feedback
+                return self.json_response(refresh_feedback(self.store))
             if route == "/api/queue":
                 return self.json_response(self.store.queue())
             if route.startswith("/api/files/") and route.endswith("/pdf-info"):

@@ -95,7 +95,7 @@ test('snapshot uses token-derived archive and responds without caching or creden
   const body = await result.text();
   assert.equal(body.includes(TOKEN),false);
   assert.equal(body.includes(KEY),false);
-  assert.deepEqual(JSON.parse(body),{...h.state.snapshot,reports:[],published_at:h.state.archive.published_at});
+  assert.deepEqual(JSON.parse(body),{...h.state.snapshot,reports:[],published_at:h.state.archive.published_at,snapshot_version:VERSION});
   assert.equal(h.calls.filter(c=>c.url.includes('family_share_links')).length,2);
 });
 
@@ -159,7 +159,8 @@ test('CORS rejects foreign, missing and opaque origins; preflight permits JSON P
     assert.equal(result.status,204); assert.equal(result.headers.get('Access-Control-Allow-Origin'),origin);
   }
   assert.equal((await h.request(undefined,{'Access-Control-Request-Method':'DELETE'},'OPTIONS')).status,403);
-  assert.equal((await h.request(undefined,{'Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'authorization'},'OPTIONS')).status,403);
+  assert.equal((await h.request(undefined,{'Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'authorization'},'OPTIONS')).status,204);
+  assert.equal((await h.request(undefined,{'Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'x-actor'},'OPTIONS')).status,403);
 });
 
 test('cross-archive snapshot, stale path, patient mismatch and unreviewed data cannot be returned', async () => {

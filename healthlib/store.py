@@ -20,6 +20,7 @@ from datetime import date, datetime, timezone
 from PIL import Image, ImageOps, UnidentifiedImageError
 from .errors import ValidationError, PrivacyReviewRequired
 from . import pdf
+from . import feedback
 
 Image.MAX_IMAGE_PIXELS = 40_000_000
 SCHEMA_VERSION = 1
@@ -137,6 +138,7 @@ class HealthStore:
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir).resolve()
         self.lock = threading.RLock()
+        self.feedback_sync_lock = threading.Lock()
         self.restore_tokens = {}
         for folder in ("inbox/grandpa", "inbox/grandma", "staging", "archive", "backups", "exports", "restore", "previews"):
             target = self.data_dir / folder
@@ -153,6 +155,7 @@ class HealthStore:
             CREATE TABLE IF NOT EXISTS patients (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS visits (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS medicine_feedback (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
@@ -165,12 +168,12 @@ class HealthStore:
             self.db.close()
 
     def _rows(self, table):
-        if table not in {"patients", "visits", "reports", "attachments"}:
+        if table not in {"patients", "visits", "reports", "attachments", "medicine_feedback"}:
             raise ValidationError("資料表不存在")
         return [json.loads(row[0]) for row in self.db.execute(f"SELECT payload FROM {table}")]
 
     def _get(self, table, item_id):
-        if table not in {"patients", "visits", "reports", "attachments"}:
+        if table not in {"patients", "visits", "reports", "attachments", "medicine_feedback"}:
             raise ValidationError("資料表不存在")
         row = self.db.execute(f"SELECT payload FROM {table} WHERE id=?", (item_id,)).fetchone()
         if not row:
@@ -217,6 +220,81 @@ class HealthStore:
             self._put("patients", patient)
             self.db.commit()
         return patient
+
+    def feedback_sync_state(self):
+        return feedback.sync_state(self.metadata("feedback_sync"))
+
+    def mark_feedback_stale(self):
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                state = self.feedback_sync_state()
+                state["stale"] = True
+                self.db.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", ("feedback_sync", json.dumps(state)))
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def _validated_feedback_merge(self, values, state):
+        if not isinstance(values, list) or len(values) > 100000:
+            raise ValidationError("服藥回饋歷史格式錯誤或數量過多")
+        incoming_state = feedback.sync_state(state)
+        current_state = self.feedback_sync_state()
+        if values and not incoming_state["scope"]:
+            raise ValidationError("服藥回饋歷史缺少同步來源")
+        if current_state["scope"] and incoming_state["scope"] and current_state["scope"] != incoming_state["scope"]:
+            raise ValidationError("服藥回饋來自不同雲端來源，未覆蓋本機歷史")
+        current = {item["id"]: item for item in self._rows("medicine_feedback")}
+        revisions = {feedback.revision_key(item): item["id"] for item in current.values()}
+        checked = []
+        for raw in values:
+            item = feedback.event(raw)
+            if item["id"] in current and current[item["id"]] != item:
+                raise ValidationError("服藥回饋歷史內容衝突，未覆蓋既有紀錄")
+            key = feedback.revision_key(item)
+            if key in revisions and revisions[key] != item["id"]:
+                raise ValidationError("服藥回饋版本衝突，未覆蓋既有紀錄")
+            current[item["id"]] = item
+            revisions[key] = item["id"]
+            checked.append(item)
+        return checked
+
+    def import_feedback(self, values, scope, cursor, complete=False):
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                state = self.feedback_sync_state()
+                incoming = feedback.sync_state({**state, "scope": scope, "cursor": cursor, "stale": not complete})
+                if cursor < state["cursor"]:
+                    raise ValidationError("服藥回饋同步游標不能倒退")
+                checked = self._validated_feedback_merge(values, incoming)
+                if complete:
+                    incoming["last_sync"] = now()
+                for item in checked:
+                    self._put("medicine_feedback", item)
+                self.db.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", ("feedback_sync", json.dumps(incoming)))
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def feedback_data(self, scope=None):
+        with self.lock:
+            state = self.feedback_sync_state()
+            history = self._rows("medicine_feedback")
+            result = {"items": [], "stale": state["stale"], "last_sync": state["last_sync"], "synced_events": 0, "cached_events": len(history)}
+            if scope is not None and state["scope"] not in (None, scope):
+                return {**result, "stale": True}
+            bindings = {(visit["patient_id"], visit["id"], med["id"]) for visit in self._rows("visits")
+                        if visit["status"] == "confirmed" and visit.get("privacy_reviewed") is True for med in visit["medicines"]}
+            latest = {}
+            for item in history:
+                key = item["patient_id"], item["visit_id"], item["medicine_id"]
+                if key in bindings and (key not in latest or item["revision"] > latest[key]["revision"]):
+                    latest[key] = item
+            result["items"] = sorted(latest.values(), key=lambda item: (item["created_at"], item["id"]), reverse=True)
+            return result
 
     def upload(self, patient_id, name, raw, kind="visit", source_group=None):
         if patient_id not in PATIENTS:
@@ -526,12 +604,21 @@ class HealthStore:
         if not isinstance(medicines, list) or len(medicines) > 100:
             raise ValidationError("藥物清單格式錯誤")
         item["medicines"] = []
+        medicine_ids = set()
         for med in medicines:
             if not isinstance(med, dict):
                 raise ValidationError("藥物紀錄格式錯誤")
             medicine = {"id": identifier(med.get("id"), "m_")}
             for field in ("name", "strength", "dose", "frequency", "instructions"):
                 medicine[field] = text(med.get(field))
+            prior_medicine = next((old for old in (existing or {}).get("medicines", []) if old["id"] == medicine["id"]), None)
+            if prior_medicine and any(medicine[field] != prior_medicine.get(field, "") for field in ("name", "strength", "dose", "frequency", "instructions")):
+                # Efficacy belongs to this precise prescription, even for a
+                # spelling correction. Old observations remain historical.
+                medicine["id"] = "m_" + uuid.uuid4().hex
+            if medicine["id"] in medicine_ids:
+                raise ValidationError("同一次求診的藥物編號不可重複")
+            medicine_ids.add(medicine["id"])
             # A label supplied and reviewed by the operator, never an inferred
             # drug class or clinical recommendation.
             medicine["category"] = text(med.get("category"), 80)
@@ -773,6 +860,8 @@ class HealthStore:
 
     def _archive_bytes(self):
         snapshot = self.confirmed_snapshot()
+        snapshot["medicine_feedback"] = self._rows("medicine_feedback")
+        snapshot["feedback_sync"] = self.feedback_sync_state()
         files = {}
         for item in snapshot["attachments"]:
             raw = self.attachment_path(item["id"]).read_bytes()
@@ -783,6 +872,8 @@ class HealthStore:
             if len(files) >= MAX_BACKUP_FILES - 2 or sum(len(value) for value in files.values()) > MAX_BACKUP_BYTES:
                 raise ValidationError("已超過單一備份 512 MB 或 4,998 張相片上限，請先分批歸檔")
         raw_snapshot = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
+        if len(raw_snapshot) + sum(len(value) for value in files.values()) > MAX_BACKUP_BYTES:
+            raise ValidationError("紀錄與回饋歷史超過單一備份 512 MB 上限，請先分批歸檔")
         files["archive.json"] = raw_snapshot
         manifest = {"format": "family-health-backup", "version": 1, "created_at": now(), "files": {name: {"size": len(raw), "sha256": digest(raw)} for name, raw in files.items()}}
         stream = io.BytesIO()
@@ -792,7 +883,10 @@ class HealthStore:
                 bundle.writestr(name, raw)
         return stream.getvalue(), manifest
 
-    def backup(self):
+    def backup(self, refresh_feedback=True):
+        if refresh_feedback:
+            from tools.feedback import refresh_feedback as refresh
+            refresh(self)
         with self.lock:
             raw, manifest = self._archive_bytes()
             name = "安康簿_" + datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + secrets.token_hex(3) + ".zip"
@@ -802,6 +896,8 @@ class HealthStore:
             os.replace(temp, path)
             data = self.data()
             result = {"name": name, "path": str(path), "created_at": manifest["created_at"], "excluded_pending": sum(not a.get("privacy_checked") for a in data["attachments"]), "excluded_drafts": sum(v["status"] != "confirmed" for v in data["visits"] + data["reports"])}
+            feedback_state = self.feedback_sync_state()
+            result.update(feedback_stale=feedback_state["stale"], last_feedback_sync=feedback_state["last_sync"], feedback_events=len(self._rows("medicine_feedback")))
             self.set_metadata("last_backup", result)
             return result
 
@@ -827,7 +923,8 @@ class HealthStore:
                 if info.is_dir() or path.is_absolute() or ".." in path.parts or "\\" in info.filename or ":" in info.filename or (info.external_attr >> 16) & 0o170000 == 0o120000:
                     raise ValidationError("備份包含不安全的檔案路徑")
                 total += info.file_size
-                if total > MAX_BACKUP_BYTES or info.file_size > MAX_IMAGE_BYTES * 2:
+                member_limit = MAX_BACKUP_BYTES if info.filename == "archive.json" else MAX_IMAGE_BYTES * 2
+                if total > MAX_BACKUP_BYTES or info.file_size > member_limit:
                     raise ValidationError("備份解壓大小超過限制")
             manifest = json.loads(bundle.read("manifest.json"))
             if manifest.get("format") != "family-health-backup" or manifest.get("version") != 1 or not isinstance(manifest.get("files"), dict):
@@ -846,6 +943,15 @@ class HealthStore:
             snapshot.setdefault("reports", [])
             if not isinstance(snapshot["reports"], list):
                 raise ValidationError("備份報告格式錯誤")
+            snapshot.setdefault("medicine_feedback", [])
+            snapshot["feedback_sync"] = feedback.sync_state(snapshot.get("feedback_sync"))
+            if not isinstance(snapshot["medicine_feedback"], list) or len(snapshot["medicine_feedback"]) > 100000:
+                raise ValidationError("備份服藥回饋歷史格式錯誤")
+            # Whitelist even checksum-valid backups. Historical orphan events
+            # are kept, but visible rows are checked against live prescriptions.
+            snapshot["medicine_feedback"] = [feedback.event(item) for item in snapshot["medicine_feedback"]]
+            if snapshot["medicine_feedback"] and not snapshot["feedback_sync"]["scope"]:
+                raise ValidationError("備份服藥回饋缺少同步來源")
             attachment_ids = set()
             expected_files = {"archive.json"}
             for item in snapshot["attachments"]:
@@ -894,7 +1000,7 @@ class HealthStore:
                     Path(old["path"]).unlink(missing_ok=True)
                     self.restore_tokens.pop(old_token)
             self.restore_tokens[token] = {"path": path, "expires": time.time() + 600, "sha256": digest(raw)}
-        return {"token": token, "visits": len(snapshot["visits"]), "reports": len(snapshot["reports"]), "attachments": len(snapshot["attachments"]), "created_at": manifest["created_at"]}
+        return {"token": token, "visits": len(snapshot["visits"]), "reports": len(snapshot["reports"]), "attachments": len(snapshot["attachments"]), "feedback_events": len(snapshot["medicine_feedback"]), "feedback_stale": snapshot["feedback_sync"]["stale"], "last_feedback_sync": snapshot["feedback_sync"]["last_sync"], "created_at": manifest["created_at"]}
 
     def restore_apply(self, token):
         with self.lock:
@@ -905,6 +1011,14 @@ class HealthStore:
             if digest(raw) != cached["sha256"]:
                 raise ValidationError("備份在預覽後有變動，請重新選擇")
             snapshot, manifest, files = self._validate_backup(raw)
+            feedback_rows = self._validated_feedback_merge(snapshot["medicine_feedback"], snapshot["feedback_sync"])
+            feedback_state = self.feedback_sync_state()
+            if feedback_state["scope"] is None:
+                feedback_state["scope"] = snapshot["feedback_sync"]["scope"]
+                feedback_state["last_sync"] = snapshot["feedback_sync"]["last_sync"]
+            # A backup cannot assert that remote history is fresh or force a
+            # cursor forward. Resync replay is safe because events are immutable.
+            feedback_state["stale"] = True
             # Validate in an isolated database before touching the live archive.
             check_dir = self.data_dir / "restore" / ("check_" + secrets.token_hex(8))
             test_store = HealthStore(check_dir)
@@ -940,7 +1054,7 @@ class HealthStore:
                     validated = test_store.upsert_report(report)
                     test_store.confirm_report(validated["id"], reviewed=True)
                 ready = test_store.confirmed_snapshot()
-                pre_restore = self.backup()
+                pre_restore = self.backup(refresh_feedback=False)
                 # All imported objects validated. Copy files to collision-free names first.
                 replacements = []
                 for attachment in ready["attachments"]:
@@ -988,6 +1102,14 @@ class HealthStore:
                     report["source_file_ids"] = [remap.get(fid, fid) for fid in report["source_file_ids"]]
                 self.db.execute("BEGIN IMMEDIATE")
                 try:
+                    # A different local process may have synced while the PDF
+                    # restore was validating. Merge again under the write lock.
+                    feedback_rows = self._validated_feedback_merge(snapshot["medicine_feedback"], snapshot["feedback_sync"])
+                    feedback_state = self.feedback_sync_state()
+                    if feedback_state["scope"] is None:
+                        feedback_state["scope"] = snapshot["feedback_sync"]["scope"]
+                        feedback_state["last_sync"] = snapshot["feedback_sync"]["last_sync"]
+                    feedback_state["stale"] = True
                     for table in ("visits", "reports", "attachments", "patients"):
                         self.db.execute(f"DELETE FROM {table}")
                     for patient in ready["patients"]:
@@ -998,13 +1120,16 @@ class HealthStore:
                         self._put("visits", visit)
                     for report in ready["reports"] + draft_reports:
                         self._put("reports", report)
+                    for item in feedback_rows:
+                        self._put("medicine_feedback", item)
+                    self.db.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", ("feedback_sync", json.dumps(feedback_state)))
                     self.db.commit()
                 except Exception:
                     self.db.rollback()
                     raise
                 self.set_metadata("last_sync", None)
                 cached["path"].unlink(missing_ok=True)
-                return {"restored": True, "visits": len(ready["visits"]), "reports": len(ready["reports"]), "attachments": len(ready["attachments"]), "preserved_drafts": len(drafts) + len(draft_reports), "preserved_pending": len(kept_attachments), "pre_restore_backup": pre_restore["name"]}
+                return {"restored": True, "visits": len(ready["visits"]), "reports": len(ready["reports"]), "attachments": len(ready["attachments"]), "preserved_drafts": len(drafts) + len(draft_reports), "preserved_pending": len(kept_attachments), "feedback_events": len(self._rows("medicine_feedback")), "feedback_stale": True, "last_feedback_sync": feedback_state["last_sync"], "pre_restore_backup": pre_restore["name"]}
             finally:
                 test_store.close()
                 if check_dir.is_relative_to(self.data_dir / "restore"):
