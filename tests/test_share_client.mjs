@@ -196,3 +196,47 @@ test('concurrent requests for one image share one request and one revocable blob
   assert.equal(h.calls.filter(c=>c.body.action==='file').length,1);assert.equal(h.created.length,1);
   client.destroy();assert.deepEqual(h.revoked,[urls[0]]);
 });
+
+function reportFixture(){
+  const data=fixture({preview:true});
+  data.visits=[];
+  data.reports=[{id:'report-one',patient_id:'grandpa',date:'2026-10-26',title:'SYNTHETIC REPORT',
+    status:'confirmed',privacy_reviewed:true,reviewed_at:'2026-10-26T00:00:00Z',source_file_ids:['file-one']}];
+  Object.assign(data.attachments[0],{mime:'application/pdf',size:4,sha256:checksum([37,80,68,70]),
+    object_path:'family/objects/file-one-'+checksum([37,80,68,70])+'.pdf'});
+  return data;
+}
+
+test('report-only snapshots expose verified PDF blobs and JPEG previews separately',async()=>{
+  const h=harness(),data=reportFixture();
+  h.setReply((url,options)=>{
+    const request=JSON.parse(options.body);
+    return request.action==='snapshot'?json(data):request.thumbnail?image('image/jpeg',[1,2]):image('application/pdf',[37,80,68,70]);
+  });
+  const client=h.client(),loaded=await client.getData();
+  assert.equal(loaded.reports[0].id,'report-one');assert.equal(loaded.visits.length,0);
+  assert.notEqual(await client.fileUrl({id:'file-one'}),await client.thumbnailUrl({id:'file-one'}));
+  assert.deepEqual(h.created.map(item=>item.blob.type),['application/pdf','image/jpeg']);
+  assert.ok(h.calls.every(call=>!call.url.includes('/objects/')));
+  client.destroy();
+});
+
+test('reports require reviewed same-patient sources and PDF safe preview under decimal50MB',async()=>{
+  for(const change of [
+    data=>{data.reports[0].status='draft';},data=>{data.reports[0].patient_id='grandma';},
+    data=>{data.reports[0].privacy_reviewed=false;},data=>{data.reports[0].source_file_ids=[];},
+    data=>{data.reports[0].review_notes='UNRESOLVED';},data=>{delete data.attachments[0].thumbnail;},
+    data=>{data.attachments[0].size=50000001;},
+  ]){
+    const h=harness(),data=reportFixture();change(data);h.setReply(()=>json(data));
+    const client=h.client();await assert.rejects(client.getData());assert.equal(h.created.length,0);client.destroy();
+  }
+});
+
+test('PDF checksum mismatch and image body posing as PDF never produce blobs',async()=>{
+  for(const response of [()=>image('application/pdf',[37,80,68,71]),()=>image('image/png',[37,80,68,70])]){
+    const h=harness();h.setReply((url,options)=>JSON.parse(options.body).action==='snapshot'?json(reportFixture()):response());
+    const client=h.client();await client.getData();await assert.rejects(client.fileUrl({id:'file-one'}));
+    assert.equal(h.created.length,0);client.destroy();
+  }
+});

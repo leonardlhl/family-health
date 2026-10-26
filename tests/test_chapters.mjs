@@ -97,12 +97,12 @@ test('switching chapter clears previous detail, draft and filters',async()=>{
   await h.action('chapters');assert.equal(h.ui.state.person,null);assert.equal(h.ui.state.editor,null);
 });
 
-test('family chapters open visits and expose only visits and medicines',async()=>{
+test('family chapters open visits and expose visits, medicines and reports',async()=>{
   const h=harness();h.ui.state.view='family';
   await h.action('chapter',{id:'grandpa'});
   assert.equal(h.ui.state.route,'visits');
   const tabs=h.ui.chapterTabs();
-  assert.match(tabs,/data-route="visits"/);assert.match(tabs,/data-route="medicines"/);
+  assert.match(tabs,/data-route="visits"/);assert.match(tabs,/data-route="medicines"/);assert.match(tabs,/data-route="reports"/);
   assert.doesNotMatch(tabs,/data-route="(?:overview|files|settings)"/);
   await h.action('nav',{route:'overview'});assert.equal(h.ui.state.route,'visits');
 });

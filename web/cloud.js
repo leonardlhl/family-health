@@ -121,12 +121,43 @@ export function createCloudClient(config = {}) {
     if (blobUrls.has(cacheKey)) return blobUrls.get(cacheKey);
     const objectPath = asset.object_path.split('/').map(encodeURIComponent).join('/');
     const response = await request(`/storage/v1/object/authenticated/family-health/${objectPath}`);
-    const blob = await response.blob();
+    const mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    const maximum = preview ? 3 * 1024 * 1024 : mime === 'application/pdf' ? 50000000 : 25 * 1024 * 1024;
+    const declared = response.headers.get('content-length');
+    if (!['image/png', 'image/jpeg', 'image/webp', 'application/pdf'].includes(mime)
+      || mime !== asset.mime || (preview && mime !== 'image/jpeg')
+      || !Number.isInteger(asset.size) || asset.size < 1 || asset.size > maximum
+      || (declared !== null && (!/^\d+$/.test(declared) || Number(declared) !== asset.size))
+      || !response.body) {
+      try { await response.body?.cancel(); } catch { /* Invalid content must not continue downloading. */ }
+      throw new Error('檔案格式或大小不符。');
+    }
+    const reader = response.body.getReader(), chunks = [];
+    let size = 0;
+    try {
+      while (true) {
+        const part = await reader.read();
+        requireEpoch(epoch);
+        if (sourceEpoch !== fileEpoch) throw new Error('紀錄已更新，請重新開啟相片。');
+        if (part.done) break;
+        size += part.value.byteLength;
+        if (size > asset.size || size > maximum) throw new Error('檔案格式或大小不符。');
+        chunks.push(part.value);
+      }
+    } catch (error) {
+      try { await reader.cancel(); } catch { /* Preserve the original failure. */ }
+      throw error;
+    } finally { reader.releaseLock(); }
+    if (size !== asset.size) throw new Error('檔案格式或大小不符。');
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const checksum = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)))
+      .map(value => value.toString(16).padStart(2, '0')).join('');
+    if (checksum !== asset.sha256) throw new Error('檔案內容已更新，請重新整理。');
     requireEpoch(epoch);
     if (sourceEpoch !== fileEpoch) throw new Error('紀錄已更新，請重新開啟相片。');
-    if (!['image/png', 'image/jpeg', 'image/webp'].includes(blob.type)) throw new Error('相片格式不受支援。');
-    if (preview && blob.type !== 'image/jpeg') throw new Error('預覽相片格式不受支援。');
-    const url = URL.createObjectURL(blob); blobUrls.set(cacheKey, url); return url;
+    const url = URL.createObjectURL(new Blob([bytes], {type:mime})); blobUrls.set(cacheKey, url); return url;
   }
   return {
     configured,
@@ -152,27 +183,40 @@ export function createCloudClient(config = {}) {
     async getSession() { return currentSession(); },
     async getData() {
       const epoch = authEpoch;
-      const archive = await getArchive();
-      requireEpoch(epoch);
       clearFiles();
-      if (!archive.current_version) return { schema_version: 1, patients: [], visits: [], attachments: [], published_at: null };
+      const generation = fileEpoch;
+      const requireGeneration = () => {
+        requireEpoch(epoch);
+        if (generation !== fileEpoch) throw new Error('紀錄已更新，請重新整理。');
+      };
+      const archive = await getArchive();
+      requireGeneration();
+      if (!archive.current_version) return { schema_version: 1, patients: [], visits: [], reports: [], attachments: [], published_at: null };
       const query = new URLSearchParams({ select: 'snapshot,published_at', archive_id: `eq.${archiveId}`, version_id: `eq.${archive.current_version}` });
       const rows = await (await request(`/rest/v1/family_snapshots?${query}`)).json();
-      requireEpoch(epoch);
+      requireGeneration();
       if (!Array.isArray(rows) || rows.length !== 1) throw new Error('紀錄正在更新，請重新整理。');
       const data = rows[0].snapshot;
-      if (data?.schema_version !== 1 || !Array.isArray(data.visits) || !Array.isArray(data.attachments) || !Array.isArray(data.patients)) {
+      if (data?.schema_version !== 1 || !Array.isArray(data.visits) || !Array.isArray(data.attachments) || !Array.isArray(data.patients)
+        || (data.reports !== undefined && !Array.isArray(data.reports))) {
         throw new Error('紀錄格式未能讀取，請聯絡管理人。');
       }
-      const prefix = `${archiveId}/${archive.current_version}/`;
-      const isScopedPath = path => typeof path === 'string' && path.startsWith(prefix) && !path.includes('..') && !path.includes('\\');
+      const extensions = {'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp','application/pdf':'.pdf'};
+      const isScopedPath = (asset, file, preview=false) => {
+        const suffix = preview ? '.thumb.jpg' : extensions[asset?.mime];
+        return typeof file.id === 'string' && /^[A-Za-z0-9_-]{1,96}$/.test(file.id)
+          && typeof asset?.sha256 === 'string' && /^[a-f0-9]{64}$/.test(asset.sha256) && suffix
+          && [ `${archiveId}/${archive.current_version}/${file.id}${suffix}`,
+            `${archiveId}/objects/${file.id}-${asset.sha256}${suffix}` ].includes(asset.object_path);
+      };
       for (const file of data.attachments) {
-        if (file.privacy_checked === true && isScopedPath(file.object_path)) {
+        if (file.privacy_checked === true && isScopedPath(file,file)) {
           const preview = file.thumbnail;
-          availableFiles.set(file.id, { ...file, thumbnail: preview?.mime === 'image/jpeg' && isScopedPath(preview.object_path) ? preview : null });
+          if (file.mime === 'application/pdf' && !(preview?.mime === 'image/jpeg' && isScopedPath(preview,file,true))) continue;
+          availableFiles.set(file.id, { ...file, thumbnail: preview?.mime === 'image/jpeg' && isScopedPath(preview,file,true) ? preview : null });
         }
       }
-      return { ...data, published_at: rows[0].published_at || archive.published_at };
+      return { ...data, reports:data.reports || [], published_at: rows[0].published_at || archive.published_at };
     },
     async fileUrl(attachment) { return imageUrl(attachment, false); },
     async thumbnailUrl(attachment) { return imageUrl(attachment, true); },
@@ -185,6 +229,7 @@ const SHARE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const SHARE_DENIED = '分享連結無效或已失效，請向管理人索取新連結。';
 const SHARE_UNAVAILABLE = '暫時未能讀取分享紀錄，請稍後再試。';
 const SHARE_MAX_IMAGE = 25 * 1024 * 1024;
+const SHARE_MAX_PDF = 50000000;
 const SHARE_MAX_SNAPSHOT = 16 * 1024 * 1024;
 
 /** Only fragments carry the capability. Do not inspect a query string or persist it. */
@@ -214,7 +259,7 @@ export function createShareClient(config, token, {onDenied} = {}) {
   const pendingImages = new Map();
   const safeId = /^[A-Za-z0-9_-]{1,96}$/;
   const safeHash = /^[a-f0-9]{64}$/;
-  const imageTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
+  const imageTypes = new Set(['image/png', 'image/jpeg', 'image/webp', 'application/pdf']);
 
   function clearFiles() {
     for (const url of blobUrls.values()) URL.revokeObjectURL(url);
@@ -288,14 +333,15 @@ export function createShareClient(config, token, {onDenied} = {}) {
   const mimeOf = response => (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
   function checkedAsset(value, thumbnail = false) {
     if (!value || !imageTypes.has(value.mime) || (thumbnail && value.mime !== 'image/jpeg')
-      || !Number.isInteger(value.size) || value.size < 1 || value.size > SHARE_MAX_IMAGE
+      || !Number.isInteger(value.size) || value.size < 1 || value.size > (thumbnail ? 3 * 1024 * 1024 : value.mime === 'application/pdf' ? SHARE_MAX_PDF : SHARE_MAX_IMAGE)
       || typeof value.sha256 !== 'string' || !safeHash.test(value.sha256)) throw new Error(SHARE_UNAVAILABLE);
     // Paths from the snapshot are deliberately excluded: image requests use IDs only.
     return {mime: value.mime, size: value.size, sha256: value.sha256};
   }
   function checkedSnapshot(data) {
     if (data?.schema_version !== 1 || !Array.isArray(data.patients)
-      || !Array.isArray(data.visits) || !Array.isArray(data.attachments)) throw new Error(SHARE_UNAVAILABLE);
+      || !Array.isArray(data.visits) || !Array.isArray(data.attachments)
+      || (data.reports !== undefined && !Array.isArray(data.reports))) throw new Error(SHARE_UNAVAILABLE);
     const patients = new Set();
     for (const patient of data.patients) {
       if (!['grandpa', 'grandma'].includes(patient?.id) || patients.has(patient.id)
@@ -305,24 +351,37 @@ export function createShareClient(config, token, {onDenied} = {}) {
     const files = new Map();
     for (const file of data.attachments) {
       if (!file || typeof file.id !== 'string' || !safeId.test(file.id) || files.has(file.id)
-        || !patients.has(file.patient_id) || file.privacy_checked !== true) throw new Error(SHARE_UNAVAILABLE);
+        || !patients.has(file.patient_id) || file.privacy_checked !== true
+        || (file.mime === 'application/pdf' && file.thumbnail === undefined)) throw new Error(SHARE_UNAVAILABLE);
       files.set(file.id, {id: file.id, patient_id: file.patient_id, ...checkedAsset(file),
         thumbnail: file.thumbnail === undefined ? null : checkedAsset(file.thumbnail, true)});
     }
     const visits = new Set();
     const linked = new Set();
+    const checkSources = (sources, patientId) => {
+      if (!Array.isArray(sources)) throw new Error(SHARE_UNAVAILABLE);
+      for (const id of sources) {
+        if (!files.has(id) || files.get(id).patient_id !== patientId) throw new Error(SHARE_UNAVAILABLE);
+        linked.add(id);
+      }
+    };
     for (const visit of data.visits) {
       if (!visit || typeof visit.id !== 'string' || !safeId.test(visit.id) || visits.has(visit.id)
         || !patients.has(visit.patient_id) || visit.status !== 'confirmed'
         || visit.privacy_reviewed !== true || !Array.isArray(visit.medicines)) throw new Error(SHARE_UNAVAILABLE);
       visits.add(visit.id);
       for (const sources of [visit.source_file_ids, ...visit.medicines.map(medicine => medicine?.source_file_ids)]) {
-        if (!Array.isArray(sources)) throw new Error(SHARE_UNAVAILABLE);
-        for (const id of sources) {
-          if (!files.has(id) || files.get(id).patient_id !== visit.patient_id) throw new Error(SHARE_UNAVAILABLE);
-          linked.add(id);
-        }
+        checkSources(sources, visit.patient_id);
       }
+    }
+    const reports = new Set();
+    for (const report of data.reports || []) {
+      if (!report || typeof report.id !== 'string' || !safeId.test(report.id) || reports.has(report.id)
+        || !patients.has(report.patient_id) || report.status !== 'confirmed' || report.privacy_reviewed !== true
+        || !report.reviewed_at || !report.date || typeof report.title !== 'string' || !report.title.trim()
+        || !Array.isArray(report.source_file_ids) || !report.source_file_ids.length || report.review_notes) throw new Error(SHARE_UNAVAILABLE);
+      reports.add(report.id);
+      checkSources(report.source_file_ids, report.patient_id);
     }
     if (linked.size !== files.size) throw new Error(SHARE_UNAVAILABLE);
     return files;
@@ -341,7 +400,7 @@ export function createShareClient(config, token, {onDenied} = {}) {
     const files = checkedSnapshot(data);
     requireEpoch(expected);
     availableFiles = files;
-    return data;
+    return {...data,reports:data.reports || []};
   }
 
   async function imageUrl(attachment, thumbnail) {
@@ -357,7 +416,7 @@ export function createShareClient(config, token, {onDenied} = {}) {
       const response = await request({action: 'file', attachmentId: file.id, thumbnail}, expected);
       const mime = mimeOf(response);
       if (!imageTypes.has(mime) || mime !== asset.mime) throw new Error(SHARE_UNAVAILABLE);
-      const bytes = await boundedBytes(response, SHARE_MAX_IMAGE, expected);
+      const bytes = await boundedBytes(response, asset.mime === 'application/pdf' ? SHARE_MAX_PDF : SHARE_MAX_IMAGE, expected);
       if (bytes.byteLength !== asset.size) throw new Error(SHARE_UNAVAILABLE);
       let checksum;
       try {

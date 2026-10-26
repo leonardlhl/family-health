@@ -294,7 +294,7 @@ class HTTPTests(unittest.TestCase):
         before_changes = self.store.db.total_changes
         status, family = self.request("GET", "/api/family-data")
         self.assertEqual(status, 200)
-        self.assertEqual(set(family), {"schema_version", "patients", "visits", "attachments"})
+        self.assertEqual(set(family), {"schema_version", "patients", "visits", "reports", "attachments"})
         self.assertEqual([v["id"] for v in family["visits"]], [confirmed["id"]])
         self.assertEqual({a["id"] for a in family["attachments"]}, {first["id"], second["id"]})
         self.assertEqual(family["visits"][0]["diagnosis"], "醫生原文")

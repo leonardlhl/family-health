@@ -4,7 +4,7 @@
 
 ## 1. 建立私人資料服務
 
-在自己的 Supabase 帳戶建立一個專用 project。在 SQL Editor 執行 `supabase/001_family_archive.sql`，再執行 `supabase/003_family_share_links.sql`。前者建立版本資料表及私人 `family-health` 相片 bucket；後者只儲存分享 token 的 SHA-256 hash，並提供僅限本機管理密鑰使用的原子更換／撤銷 RPC。沒有分享 token 或資料會寫入這些 SQL 檔案。
+在自己的 Supabase 帳戶建立一個專用 project。在 SQL Editor 依次執行 `supabase/001_family_archive.sql`、`supabase/003_family_share_links.sql`、`supabase/004_reports_storage.sql`。它們建立私人版本資料、分享 token hash、報告／PDF 支援及容量統計。分享表只儲存 SHA-256 hash；更換／撤銷 RPC 僅供本機管理密鑰使用。004 保留 bucket 私人、放寬為最多 50,000,000 bytes 的已匿名 PDF，並容許同一個不可覆寫檔案被多個版本引用。已有分享連結及版本不會被修改。
 
 在 Edge Functions 以 **Via Editor** 建立名稱為 `family-share` 的 function，完整貼入 `supabase/functions/family-share/index.ts`。這是一個無外部依賴的單檔。將此 function 的 **Verify JWT** 關閉；CLI 對應設定已放在 `supabase/config.toml` 的 `verify_jwt = false`。它改為驗證 POST body 內的私人 token，並非開放匿名讀取。這個部署方式與設定見 [Dashboard 官方教學](https://supabase.com/docs/guides/functions/quickstart-dashboard)及 [function 驗證設定](https://supabase.com/docs/guides/functions/auth-headers)。
 
@@ -77,11 +77,25 @@ python tools/publish.py
 
 工具只取 `HealthStore.confirmed_snapshot()`，再逐欄篩選。病人只保留「爺爺／嬷嬷」、年齡與性別；不發布身份欄位、原檔名、原始 OCR 或本機路徑。自由文字仍需管理人核對，程式不能保證從診斷／備註自動找出每種身份資料。相片必須完成私隱檢查，且 checksum 與目前檔案一致。
 
-工具先上傳新版本所有私人相片，全部成功才呼叫資料庫交易切換目前版本；失敗時家人仍看上一個完整版本。舊相片及版本由後端保留但對家人不可讀；定期由管理人清理不再需要的版本，避免無限累積。這不代替本機完整備份。
+工具使用包含附件 ID、實際檔案 SHA-256 及格式的固定儲存路徑。新版本可重用已核實的舊相片／PDF；僅缺少的檔案才上傳。重用前串流讀回檔案並核對大小與 SHA-256，不單憑檔名或大小判斷。相片、PDF 與縮圖各自核對。遇到同路徑但 bytes 不符會停止，不覆寫亦不刪除。
+
+所有檔案就緒才以資料庫交易切換目前版本；失敗時家人仍看上一個完整版本。內容完全沒改時，工具核對遠端目前版本、完整 manifest、所有檔案及目前版本指標後跳過發布。這個完整性核對會使用讀取流量；儲存空間與月度流量屬不同限制。
+
+004 之前每版本各自儲存的舊副本會繼續保留及計入容量。新路徑重用只減少之後的重複儲存；新增或修改內容仍會增加容量。程式沒有自動刪除歷史或孤立檔案，也不會更換私人分享 token。家人仍只能透過目前 manifest 讀取，知道舊檔案路徑並不取得讀取權。這不代替本機完整備份。
 
 藥物列表使用獨立壓縮預覽：已完成私隱處理的相片產生最長邊 960 px、JPEG 品質 86 的無 metadata 副本。完整解像度歸檔相片仍保留，點開相片時讀取完整版本。預覽亦存在私人 bucket，與原圖使用同一登入及版本權限，並在整批成功後才公開給已授權家人。未確認／未完成私隱檢查的相片不會產生供雲端發布的預覽。
 
-## 4. 發布後驗證
+報告使用 schema v1 的選填 `reports` 陣列，舊版本沒有這個欄位時當作空陣列。只有已確認、已完成私隱檢查、同一人物的來源才可發布。PDF 必須先由本機程式把全部頁面重建為像素頁面，去除隱藏文字、metadata、連結、註解及內嵌附件；單一安全 PDF 上限 50,000,000 bytes，圖片仍為 25 MiB。PDF 首頁 JPEG 縮圖與完整 PDF 分開儲存；兩者都檢查 MIME、大小及 SHA-256。私人服務沒有接受任意路徑的下載入口。
+
+## 4. 容量查看
+
+本機設定頁的 `GET /api/storage` 需要管理版 CSRF；命令列可用 `python tools/storage.py --data-dir YOUR_PRIVATE_DIRECTORY`。它只量度檔案大小與查詢容量，沒有刪除或上傳操作。雲端統計由僅 service_role 可執行的 `family_storage_usage('family')` 回傳。
+
+`bucket_bytes` 包含 `family-health` bucket 所有保留版本及未被 manifest 引用的檔案；`archive_bytes` 是目前家庭前綴，`current_bytes` 是目前版本實際引用的檔案。`retained_versions`、`unreferenced_files` 只作報告，不自動清理。若 Storage metadata 缺少大小，`unknown_size_files` 及 `usage_incomplete` 會標示計數不完整；服務不可用時用量保持 null，不能當成零。
+
+容量條以 Free 方案 1,000,000,000 bytes 檔案及 500,000,000 bytes 資料庫作明確標示的參考，80% 提示。它不是已讀取帳單的真實配額，也不量度其他 buckets、月度流量或帳戶其他 projects。資料庫數字是整個目前 project 的資料庫大小。本機 source 只計已管理的 inbox/staging；archive、縮圖與備份分開計算，外部收相資料夾不會被容量工具掃描。
+
+## 5. 發布後驗證
 
 新 project 執行 `001_family_archive.sql` 後，可在 SQL Editor 以 postgres 身份一次執行完整 `supabase/verify_readonly.sql`。它用可回滾的合成資料及 JWT claims 測試未登入、名單外、名單內身份，並核對舊版本／其他家庭隔離、家人 SELECT-only 權限、發布 RPC 及相片寫入限制。它不建立 Auth 帳戶、不設定密碼、不上傳相片；storage 只有測試用 metadata 行。
 

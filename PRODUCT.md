@@ -16,3 +16,10 @@ The user explicitly permits patient age and sex (nullable age, unknown/male/fema
 Final retrieval navigation: only visits and medicines; chapter defaults to visits. Overview and appointment management are operator-only. Medicines group by visit date newest first; left category index filters the current patient, with a horizontal mobile equivalent. Optional medicine.category is user-confirmed text, empty values show Uncategorized; no inferred clinical categories.
 
 2026-10-25 latest: user wants links sent to family to open without login. Use a random 256-bit revocable capability in URL fragment; private Edge function checks its hash and active archive version for every snapshot/image request. Keep all medical tables and storage private. Operator manages create/rotate/revoke locally; share plaintext is local-private only, never Git/build/backups. Bare website retains optional invited-account login.
+
+
+## 報告章節與容量（2026-10-26）
+
+家人檢索版每個人物有「就診、藥物、報告」。報告按日期由新至舊，支援日期、內容、醫生與機構檢索，保留安全圖片及多頁 PDF。操作版另有草稿、逐頁匿名處理、標題／種類／摘要編輯和容量檢視。標準資料夾是日期加簡要內容；文件名加人物代稱及序號。姓名及身份資料不得保存到安全檔案或雲端。
+
+報告收件根資料夾分爺爺與嬷嬷，支持有界遞迴掃描。大 PDF 有50MB/80頁和像素限制，以清晰可讀為先壓縮。相同媒體跨發布版本重用，不自動刪除舊版本。免費配額僅作參考，80%提示；原始收件和本機備份不算入雲端文件用量。免登入完整連結維持既有安全長度。

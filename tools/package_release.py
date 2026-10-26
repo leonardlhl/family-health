@@ -31,7 +31,7 @@ def package(destination):
     destination = Path(destination).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     files = source_files()
-    manifest = {'product':'Family Health','version':'1.1.0','contains_patient_data':False,'files':{str(p.relative_to(ROOT)).replace('\\','/'):hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}
+    manifest = {'product':'Family Health','version':'1.2.0','contains_patient_data':False,'files':{str(p.relative_to(ROOT)).replace('\\','/'):hashlib.sha256(p.read_bytes()).hexdigest() for p in files}}
     with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
         for path in files:
             archive.write(path, 'FamilyHealth/' + str(path.relative_to(ROOT)).replace('\\','/'))

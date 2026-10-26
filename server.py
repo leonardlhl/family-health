@@ -13,12 +13,12 @@ import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-from healthlib.store import HealthStore, ValidationError, PrivacyReviewRequired, decode_base64, MAX_BACKUP_BYTES
+from healthlib.store import HealthStore, ValidationError, PrivacyReviewRequired, decode_base64, MAX_BACKUP_BYTES, MAX_FILE_BYTES
 from tools.share import ShareManager, ShareError
 
 ROOT = Path(__file__).resolve().parent
 WEB = ROOT / "web"
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 APP_ID = "family-health"
 
 
@@ -47,7 +47,7 @@ class LocalServer(ThreadingHTTPServer):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FamilyHealth/1.0"
+    server_version = "FamilyHealth/1.2"
 
     def log_message(self, fmt, *args):
         # Request URLs can contain medical record identifiers. No access log.
@@ -92,10 +92,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def file_response(self, path, mime=None, download=False):
-        raw = path.read_bytes()
+        return self.bytes_response(path.read_bytes(), mime or mimetypes.guess_type(path.name)[0] or "application/octet-stream", download)
+
+    def bytes_response(self, raw, mime, download=False):
         self.send_response(200)
         self.common_headers()
-        self.send_header("Content-Type", mime or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        self.send_header("Content-Type", mime)
         self.send_header("Content-Length", str(len(raw)))
         if download:
             self.send_header("Content-Disposition", "attachment; filename=family-health-backup.zip")
@@ -110,6 +112,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             raise ValidationError("要求格式錯誤") from exc
         limit = (MAX_BACKUP_BYTES * 4 // 3 + 1000) if self.path.startswith("/api/restore/preview") else 36 * 1024 * 1024
+        if urlsplit(self.path).path == "/api/upload":
+            limit = MAX_FILE_BYTES * 4 // 3 + 10000
+        elif urlsplit(self.path).path.endswith("/sanitize-pdf"):
+            limit = 2 * 1024 * 1024
         if size <= 0 or size > limit:
             raise ValidationError("要求內容過大或為空")
         try:
@@ -136,8 +142,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.guard(mutate=True):
                     return
                 return self.json_response(ShareManager(self.store.data_dir).status())
+            if route == "/api/storage":
+                if not self.guard(mutate=True):
+                    return
+                from tools.storage import storage_status
+                return self.json_response(storage_status(self.store.data_dir))
             if route == "/api/queue":
                 return self.json_response(self.store.queue())
+            if route.startswith("/api/files/") and route.endswith("/pdf-info"):
+                return self.json_response(self.store.pdf_info(route.split("/")[3]))
+            if route.startswith("/api/files/") and "/page/" in route:
+                parts = route.split("/")
+                if len(parts) != 6 or not parts[5].isdigit():
+                    raise ValidationError("PDF 頁碼格式錯誤")
+                return self.bytes_response(self.store.pdf_page(parts[3], int(parts[5])), "image/png")
             if route.startswith("/api/files/") and route.endswith("/thumbnail"):
                 file_id = route.removeprefix("/api/files/").removesuffix("/thumbnail")
                 return self.file_response(self.store.thumbnail_path(file_id), "image/jpeg")
@@ -171,17 +189,25 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/scan":
                 result = self.store.scan()
             elif route == "/api/upload":
-                result = self.store.upload(value.get("patient_id"), value.get("name", ""), decode_base64(value.get("content_base64")))
+                result = self.store.upload(value.get("patient_id"), value.get("name", ""), decode_base64(value.get("content_base64"), MAX_FILE_BYTES), value.get("kind", "visit"))
             elif route == "/api/patients":
                 result = self.store.update_patient(value)
             elif route == "/api/visits":
                 result = self.store.upsert_visit(value)
             elif route.startswith("/api/visits/") and route.endswith("/confirm"):
                 result = self.store.confirm_visit(route.split("/")[3], value.get("reviewed"))
+            elif route == "/api/reports":
+                result = self.store.upsert_report(value)
+            elif route.startswith("/api/reports/") and route.endswith("/confirm"):
+                result = self.store.confirm_report(route.split("/")[3], value.get("reviewed"))
+            elif route.startswith("/api/reports/") and route.endswith("/delete"):
+                result = self.store.delete_report(route.split("/")[3])
             elif route.startswith("/api/appointments/"):
                 result = self.store.appointment_status(route.removeprefix("/api/appointments/"), value.get("status"))
             elif route.startswith("/api/files/") and route.endswith("/sanitize"):
                 result = self.store.sanitize_attachment(route.split("/")[3], decode_base64(value.get("content_base64")), value.get("privacy_checked"))
+            elif route.startswith("/api/files/") and route.endswith("/sanitize-pdf"):
+                result = self.store.sanitize_pdf(route.split("/")[3], value.get("pages"), value.get("reviewed_pages"), value.get("privacy_checked"), value.get("source_sha256"))
             elif route.startswith("/api/files/") and route.endswith("/privacy"):
                 result = self.store.review_attachment(route.split("/")[3], value.get("reviewed"))
             elif route == "/api/backup":

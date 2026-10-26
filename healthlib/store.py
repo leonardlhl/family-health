@@ -18,10 +18,13 @@ import zipfile
 from datetime import date, datetime, timezone
 
 from PIL import Image, ImageOps, UnidentifiedImageError
+from .errors import ValidationError, PrivacyReviewRequired
+from . import pdf
 
 Image.MAX_IMAGE_PIXELS = 40_000_000
 SCHEMA_VERSION = 1
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_FILE_BYTES = pdf.MAX_PDF_BYTES
 MAX_BACKUP_BYTES = 512 * 1024 * 1024
 MAX_BACKUP_FILES = 5000
 THUMBNAIL_EDGE = 960
@@ -29,14 +32,6 @@ THUMBNAIL_QUALITY = 86
 THUMBNAIL_VERSION = "v1"
 PATIENTS = {"grandpa": "爺爺", "grandma": "嬷嬷"}
 SAFE_ID = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
-
-
-class ValidationError(ValueError):
-    pass
-
-
-class PrivacyReviewRequired(ValidationError):
-    """A preview must never be generated from an unreviewed source."""
 
 
 def now():
@@ -101,10 +96,11 @@ def decode_base64(value, max_bytes=MAX_IMAGE_BYTES):
 
 
 def inspect_image(raw, allow_pdf=True):
+    if raw.startswith(b"%PDF-") and allow_pdf:
+        pdf.info(raw)
+        return "application/pdf", ".pdf"
     if not raw or len(raw) > MAX_IMAGE_BYTES:
         raise ValidationError("相片須小於 25 MB")
-    if raw.startswith(b"%PDF-") and allow_pdf:
-        return "application/pdf", ".pdf"
     try:
         with Image.open(io.BytesIO(raw)) as im:
             if im.format not in {"PNG", "JPEG", "WEBP"}:
@@ -156,6 +152,7 @@ class HealthStore:
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS patients (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS visits (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS attachments (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
@@ -168,12 +165,12 @@ class HealthStore:
             self.db.close()
 
     def _rows(self, table):
-        if table not in {"patients", "visits", "attachments"}:
+        if table not in {"patients", "visits", "reports", "attachments"}:
             raise ValidationError("資料表不存在")
         return [json.loads(row[0]) for row in self.db.execute(f"SELECT payload FROM {table}")]
 
     def _get(self, table, item_id):
-        if table not in {"patients", "visits", "attachments"}:
+        if table not in {"patients", "visits", "reports", "attachments"}:
             raise ValidationError("資料表不存在")
         row = self.db.execute(f"SELECT payload FROM {table} WHERE id=?", (item_id,)).fetchone()
         if not row:
@@ -195,13 +192,14 @@ class HealthStore:
 
     @staticmethod
     def _public_attachment(item):
-        fields = {"id", "patient_id", "original_name", "archive_name", "sha256", "mime", "size", "status", "privacy_checked", "imported_at", "ocr_text", "privacy_reviewed_at"}
+        fields = {"id", "patient_id", "original_name", "archive_name", "sha256", "mime", "size", "status", "privacy_checked", "imported_at", "ocr_text", "privacy_reviewed_at", "kind", "source_group", "pages"}
         return {key: value for key, value in item.items() if key in fields}
 
     def data(self):
         with self.lock:
             visits = sorted(self._rows("visits"), key=lambda x: (x.get("date") or "", x["updated_at"]), reverse=True)
-            return {"schema_version": SCHEMA_VERSION, "patients": self._rows("patients"), "visits": visits, "attachments": [self._public_attachment(x) for x in self._rows("attachments")]}
+            reports = sorted(self._rows("reports"), key=lambda x: (x.get("date") or "", x["updated_at"]), reverse=True)
+            return {"schema_version": SCHEMA_VERSION, "patients": self._rows("patients"), "visits": visits, "reports": reports, "attachments": [self._public_attachment(x) for x in self._rows("attachments")]}
 
     def update_patient(self, value):
         if not isinstance(value, dict) or value.get("id") not in PATIENTS:
@@ -220,9 +218,11 @@ class HealthStore:
             self.db.commit()
         return patient
 
-    def upload(self, patient_id, name, raw):
+    def upload(self, patient_id, name, raw, kind="visit", source_group=None):
         if patient_id not in PATIENTS:
             raise ValidationError("請選擇爺爺或嬷嬷")
+        if kind not in {"visit", "report"}:
+            raise ValidationError("來源類別須為 visit 或 report")
         mime, ext = inspect_image(raw)
         checksum = digest(raw)
         with self.lock:
@@ -233,7 +233,11 @@ class HealthStore:
             relative = f"staging/{item_id}{ext}"
             target = self.data_dir / relative
             target.write_bytes(raw)
-            item = {"id": item_id, "patient_id": patient_id, "original_name": "待處理相片" + ext, "archive_name": "", "sha256": checksum, "source_sha256": checksum, "mime": mime, "size": len(raw), "status": "pending", "privacy_checked": False, "imported_at": now(), "ocr_text": "", "path": relative}
+            item = {"id": item_id, "patient_id": patient_id, "original_name": "待處理檔案" + ext, "archive_name": "", "sha256": checksum, "source_sha256": checksum, "mime": mime, "size": len(raw), "status": "pending", "privacy_checked": False, "imported_at": now(), "ocr_text": "", "path": relative, "kind": kind}
+            if source_group:
+                item["source_group"] = identifier(source_group, "g_")
+            if mime == "application/pdf":
+                item["pages"] = pdf.info(raw)["pages"]
             self._put("attachments", item)
             self.db.commit()
             return self._public_attachment(item)
@@ -262,6 +266,9 @@ class HealthStore:
             try:
                 if not isinstance(item, dict) or item.get("patient_id") not in PATIENTS:
                     raise ValidationError("人物須使用 grandpa 或 grandma")
+                kind = item.get("kind", "visit")
+                if kind not in {"visit", "report"}:
+                    raise ValidationError("類別須使用 visit 或 report")
                 raw_path = item.get("path")
                 if not isinstance(raw_path, str) or not raw_path or len(raw_path) > 4096:
                     raise ValidationError("資料夾路徑格式錯誤")
@@ -280,7 +287,7 @@ class HealthStore:
                         raise ValidationError("同一資料夾只可屬於一位家人")
                     continue
                 seen[key] = item["patient_id"]
-                result["folders"].append({"patient_id": item["patient_id"], "path": str(folder)})
+                result["folders"].append({"patient_id": item["patient_id"], "path": str(folder), "kind": kind})
             except (OSError, ValidationError, RuntimeError) as exc:
                 result["warnings"].append(f"第 {index} 個匯入資料夾：{exc}")
         return result
@@ -294,7 +301,33 @@ class HealthStore:
             patient_id, folder = entry["patient_id"], Path(entry["path"])
             try:
                 children = sorted(folder.iterdir())
-            except OSError:
+                if entry.get("kind") == "report":
+                    # Report sources can be grouped in subfolders. Never follow
+                    # symlinks/junctions or walk outside the configured root.
+                    pending_dirs = [(folder, 0)]
+                    children = []
+                    visited = 0
+                    while pending_dirs:
+                        current, depth = pending_dirs.pop()
+                        visited += 1
+                        if visited > 1000:
+                            raise ValidationError("報告資料夾超過 1,000 個子資料夾，請分批處理")
+                        for path in sorted(current.iterdir()):
+                            if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+                                result["skipped"] += 1
+                                continue
+                            if not path.resolve().is_relative_to(folder.resolve()):
+                                raise ValidationError("報告來源不可超出指定資料夾")
+                            if path.is_dir():
+                                if depth >= 8:
+                                    result["skipped"] += 1
+                                else:
+                                    pending_dirs.append((path, depth + 1))
+                            else:
+                                children.append(path)
+                            if len(children) > 2000:
+                                raise ValidationError("報告來源超過 2,000 個檔案，請分批處理")
+            except (OSError, ValidationError):
                 result["errors"].append({"patient_id": patient_id, "error": "匯入資料夾暫時無法讀取"})
                 continue
             for path in children:
@@ -302,9 +335,12 @@ class HealthStore:
                     result["skipped"] += 1
                     continue
                 try:
-                    if path.stat().st_size > MAX_IMAGE_BYTES:
-                        raise ValidationError("相片超過 25 MB")
-                    item = self.upload(patient_id, path.name, path.read_bytes())
+                    limit = MAX_FILE_BYTES if path.suffix.lower() == ".pdf" else MAX_IMAGE_BYTES
+                    if path.stat().st_size > limit:
+                        raise ValidationError("檔案超過相片 25 MB／PDF 50 MB 限制")
+                    kind = entry.get("kind", "visit")
+                    group = "g_" + digest(str(path.parent.resolve()).casefold().encode("utf-8"))[:24] if kind == "report" else None
+                    item = self.upload(patient_id, path.name, path.read_bytes(), kind, group)
                     result["duplicates" if item.get("duplicate") else "imported"] += 1
                 except (OSError, ValidationError) as exc:
                     result["skipped"] += 1
@@ -347,7 +383,7 @@ class HealthStore:
                 raise PrivacyReviewRequired("相片尚未完成私隱核對，暫不提供藥物預覽")
             source_path = self.attachment_path(item_id)
             archive_dir = (self.data_dir / "archive").resolve()
-            if item.get("mime") not in {"image/png", "image/jpeg", "image/webp"} or source_path.parent != archive_dir:
+            if item.get("mime") not in {"image/png", "image/jpeg", "image/webp", "application/pdf"} or not source_path.is_relative_to(archive_dir):
                 raise PrivacyReviewRequired("只可從已核對的歸檔相片建立預覽")
             source_bytes = source_path.read_bytes()
             checksum = digest(source_bytes)
@@ -370,6 +406,8 @@ class HealthStore:
                 except (OSError, ValueError, Image.DecompressionBombError):
                     target.unlink(missing_ok=True)
             try:
+                if item["mime"] == "application/pdf":
+                    source_bytes = pdf.page_png(source_bytes, 0)
                 with Image.open(io.BytesIO(source_bytes)) as source:
                     oriented = ImageOps.exif_transpose(source)
                     pixels = oriented.convert("RGB")
@@ -399,36 +437,69 @@ class HealthStore:
                 width, height = image.size
             return {"mime": "image/jpeg", "sha256": digest(raw), "size": len(raw), "width": width, "height": height}
 
+    def _save_sanitized(self, item_id, pixels, mime, extension, pages=None):
+        item = self._get("attachments", item_id)
+        old_path = self.attachment_path(item_id)
+        archive_dir = self.data_dir / "archive"
+        new_path = old_path if old_path.is_relative_to(archive_dir) and old_path.suffix == extension else archive_dir / (item_id + extension)
+        temporary = new_path.with_name(new_path.name + "." + secrets.token_hex(4) + ".tmp")
+        temporary.write_bytes(pixels)
+        os.replace(temporary, new_path)
+        item.update(path=new_path.relative_to(self.data_dir).as_posix(), mime=mime, size=len(pixels), sha256=digest(pixels), privacy_checked=True, original_name="", archive_name=new_path.name, ocr_text="", privacy_reviewed_at=now())
+        if pages is not None:
+            item["pages"] = pages
+        self._put("attachments", item)
+        for table in ("visits", "reports"):
+            for record in self._rows(table):
+                if item_id in self._all_source_ids(record) and record["status"] == "confirmed":
+                    record.update(status="draft", privacy_reviewed=False, reviewed_at=None, updated_at=now())
+                    self._put(table, record)
+        self.db.commit()
+        self._invalidate_thumbnails(item_id)
+        if old_path != new_path and old_path.is_relative_to(self.data_dir):
+            old_path.unlink(missing_ok=True)
+        return self._public_attachment(item)
+
+    def pdf_info(self, item_id):
+        with self.lock:
+            item = self._get("attachments", item_id)
+            if item["mime"] != "application/pdf":
+                raise ValidationError("這個來源不是 PDF")
+            raw = self.attachment_path(item_id).read_bytes()
+            if digest(raw) != item["sha256"]:
+                raise ValidationError("PDF 檢查碼不符，請重新核對來源")
+            return {**pdf.info(raw), "sha256": item["sha256"], "privacy_checked": item.get("privacy_checked") is True}
+
+    def pdf_page(self, item_id, page_number):
+        with self.lock:
+            self.pdf_info(item_id)
+            return pdf.page_png(self.attachment_path(item_id).read_bytes(), page_number)
+
+    def sanitize_pdf(self, item_id, pages, reviewed_pages, reviewed=False, source_sha256=None):
+        if reviewed is not True:
+            raise ValidationError("請先確認每頁已遮蓋所有病人身份資料")
+        with self.lock:
+            information = self.pdf_info(item_id)
+            if source_sha256 != information["sha256"]:
+                raise ValidationError("PDF 已改變，請重新逐頁核對")
+            pixels = pdf.sanitize(self.attachment_path(item_id).read_bytes(), pages, reviewed_pages)
+            return self._save_sanitized(item_id, pixels, "application/pdf", ".pdf", information["pages"])
+
     def sanitize_attachment(self, item_id, raw, reviewed=False):
         if reviewed is not True:
             raise ValidationError("請先確認相片已遮蓋所有病人身份資料")
-        pixels = clean_image(raw)
         with self.lock:
             item = self._get("attachments", item_id)
-            old_path = self.attachment_path(item_id)
-            relative = f"archive/{item_id}.png"
-            new_path = self.data_dir / relative
-            temp = new_path.with_suffix(".tmp")
-            temp.write_bytes(pixels)
-            os.replace(temp, new_path)
-            item.update(path=relative, mime="image/png", size=len(pixels), sha256=digest(pixels), privacy_checked=True, original_name="", archive_name=new_path.name, ocr_text="", privacy_reviewed_at=now())
-            self._put("attachments", item)
-            # Re-reviewing a changed source invalidates any confirmed record using it.
-            for visit in self._rows("visits"):
-                if item_id in self._all_source_ids(visit) and visit["status"] == "confirmed":
-                    visit.update(status="draft", privacy_reviewed=False, reviewed_at=None, updated_at=now())
-                    self._put("visits", visit)
-            self.db.commit()
-            self._invalidate_thumbnails(item_id)
-            if old_path != new_path and old_path.is_relative_to(self.data_dir):
-                old_path.unlink(missing_ok=True)
-            return self._public_attachment(item)
+            if item["mime"] == "application/pdf":
+                raise ValidationError("PDF 必須使用逐頁遮蓋及核對功能，不可用單張圖片取代")
+            pixels = clean_image(raw)
+            return self._save_sanitized(item_id, pixels, "image/png", ".png")
 
     def review_attachment(self, item_id, reviewed=False):
         with self.lock:
             item = self._get("attachments", item_id)
             if item["mime"] == "application/pdf":
-                raise ValidationError("PDF 請先轉成圖片，遮蓋身份資料後再匯入；原 PDF 只留在待處理區")
+                raise ValidationError("PDF 請使用逐頁遮蓋及核對功能")
             return self.sanitize_attachment(item_id, self.attachment_path(item_id).read_bytes(), reviewed)
 
     @staticmethod
@@ -502,6 +573,109 @@ class HealthStore:
             self.db.commit()
             return item
 
+    def _validated_report(self, value, existing=None):
+        if not isinstance(value, dict) or value.get("patient_id") not in PATIENTS:
+            raise ValidationError("請選擇爺爺或嬷嬷，並提供有效報告紀錄")
+        allowed = {"id", "patient_id", "date", "title", "category", "facility", "doctor", "summary", "notes", "review_notes", "status", "privacy_reviewed", "source_file_ids", "created_at", "updated_at", "reviewed_at"}
+        if set(value) - allowed:
+            raise ValidationError("報告包含不支援的欄位；請勿保留病人身份資料")
+        item = {"id": identifier(value.get("id"), "r_"), "patient_id": value["patient_id"], "date": iso_date(value.get("date")), "status": "draft", "privacy_reviewed": False, "created_at": existing["created_at"] if existing else now(), "updated_at": now(), "reviewed_at": None}
+        for field in ("title", "category", "facility", "doctor", "summary", "notes", "review_notes"):
+            item[field] = text(value.get(field), 120 if field == "title" else 80 if field == "category" else 10000)
+        item["source_file_ids"] = source_ids(value.get("source_file_ids"))
+        for file_id in item["source_file_ids"]:
+            if self._get("attachments", file_id)["patient_id"] != item["patient_id"]:
+                raise ValidationError("報告來源屬於另一位家人，請核對人物")
+        return item
+
+    def upsert_report(self, value):
+        with self.lock:
+            existing = None
+            if isinstance(value, dict) and value.get("id"):
+                row = self.db.execute("SELECT payload FROM reports WHERE id=?", (value["id"],)).fetchone()
+                existing = json.loads(row[0]) if row else None
+            item = self._validated_report(value, existing)
+            self._put("reports", item)
+            for file_id in item["source_file_ids"]:
+                attachment = self._get("attachments", file_id)
+                attachment["status"] = "linked"
+                self._put("attachments", attachment)
+            self.db.commit()
+            return item
+
+    def _assert_report_confirmable(self, item):
+        if not item.get("date") or not item.get("title", "").strip() or not item.get("source_file_ids"):
+            raise ValidationError("確認報告前請填寫日期、簡介標題，並連結至少一個來源檔案")
+        if item.get("review_notes", "").strip():
+            raise ValidationError("報告仍有待核對內容，請核對來源後清除待核對備註")
+        for file_id in item["source_file_ids"]:
+            source = self._get("attachments", file_id)
+            if source["patient_id"] != item["patient_id"] or source.get("privacy_checked") is not True:
+                raise ValidationError("請先遮蓋並確認所有報告來源沒有病人身份資料")
+
+    def _archive_record_sources(self, item, table):
+        """Move each managed source once; shared references keep one physical file."""
+        report = table == "reports"
+        label = item["title"] if report else item["doctor"] or item["clinic"]
+        base = self.data_dir / "archive"
+        folder = base / "reports" / item["patient_id"] / safe_filename(item["date"] + "_" + label[:60]) if report else base
+        for component in (folder, *folder.parents):
+            if component == self.data_dir:
+                break
+            if component.is_symlink() or getattr(component, "is_junction", lambda: False)():
+                raise ValidationError("歸檔資料夾不能使用符號連結或連接點")
+        if not folder.resolve().is_relative_to(base.resolve()):
+            raise ValidationError("歸檔資料夾路徑不安全")
+        folder.mkdir(parents=True, exist_ok=True)
+        moved = []
+        try:
+            for index, file_id in enumerate(self._all_source_ids(item), 1):
+                source = self._get("attachments", file_id)
+                # A source linked by another confirmed record is already named.
+                if source.get("archive_owner_id") and source["archive_owner_id"] != item["id"]:
+                    continue
+                old_path = self.attachment_path(file_id)
+                extension = ".pdf" if source["mime"] == "application/pdf" else ".png"
+                name = safe_filename(f"{item['date']}_{PATIENTS[item['patient_id']]}_{label[:60]}_{index:02d}") + extension
+                new_path = folder / name
+                if old_path != new_path and new_path.exists():
+                    name = safe_filename(new_path.stem + "_" + file_id[-12:]) + extension
+                    new_path = folder / name
+                    if new_path.exists() and old_path != new_path:
+                        raise ValidationError("歸檔名稱已被其他檔案使用，請檢查報告簡介")
+                if old_path != new_path:
+                    os.rename(old_path, new_path)
+                    moved.append((old_path, new_path))
+                source.update(path=new_path.relative_to(self.data_dir).as_posix(), archive_name=name, status="linked", archive_owner_id=item["id"])
+                self._put("attachments", source)
+            self._put(table, item)
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            for old_path, new_path in reversed(moved):
+                if new_path.exists() and not old_path.exists():
+                    os.rename(new_path, old_path)
+            raise
+
+    def confirm_report(self, item_id, reviewed=False):
+        if reviewed is not True:
+            raise ValidationError("請確認報告資料準確，並已移除病人身份資料")
+        with self.lock:
+            item = self._get("reports", item_id)
+            self._assert_report_confirmable(item)
+            item.update(status="confirmed", privacy_reviewed=True, reviewed_at=now(), updated_at=now())
+            self._archive_record_sources(item, "reports")
+            return item
+
+    def delete_report(self, item_id):
+        with self.lock:
+            item = self._get("reports", item_id)
+            if item["status"] != "draft":
+                raise ValidationError("只可移除草稿；已確認報告請先編輯並重新核對")
+            self.db.execute("DELETE FROM reports WHERE id=?", (item_id,))
+            self.db.commit()
+            return {"deleted": True, "id": item_id, "sources_preserved": True}
+
     def _assert_confirmable(self, item):
         if not item.get("date") or not (item.get("doctor") or item.get("clinic")):
             raise ValidationError("確認前請填寫求診日期及醫生或診所")
@@ -521,17 +695,7 @@ class HealthStore:
             item = self._get("visits", item_id)
             self._assert_confirmable(item)
             item.update(status="confirmed", privacy_reviewed=True, reviewed_at=now(), updated_at=now())
-            for index, file_id in enumerate(self._all_source_ids(item), 1):
-                source = self._get("attachments", file_id)
-                old_path = self.attachment_path(file_id)
-                name = safe_filename(f"{item['date']}_{PATIENTS[item['patient_id']]}_{item['doctor'] or item['clinic']}_紀錄_{index:02d}_{file_id[-8:]}") + ".png"
-                new_path = self.data_dir / "archive" / name
-                if old_path != new_path:
-                    os.replace(old_path, new_path)
-                source.update(path="archive/" + name, archive_name=name, status="linked")
-                self._put("attachments", source)
-            self._put("visits", item)
-            self.db.commit()
+            self._archive_record_sources(item, "visits")
             return item
 
     def appointment_status(self, item_id, status):
@@ -551,11 +715,16 @@ class HealthStore:
         with self.lock:
             result = self.data()
             visits = [v for v in result["visits"] if v["status"] == "confirmed" and v.get("privacy_reviewed")]
+            reports = [v for v in result["reports"] if v["status"] == "confirmed" and v.get("privacy_reviewed")]
             needed = set()
             for visit in visits:
                 self._assert_confirmable(visit)
                 needed.update(self._all_source_ids(visit))
+            for report in reports:
+                self._assert_report_confirmable(report)
+                needed.update(report["source_file_ids"])
             result["visits"] = visits
+            result["reports"] = reports
             result["attachments"] = [{**a, "original_name": "", "ocr_text": ""} for a in result["attachments"] if a["id"] in needed and a.get("privacy_checked")]
             return result
 
@@ -589,16 +758,17 @@ class HealthStore:
                 visit["appointment"] = selected(appointment, ("date", "time", "location", "status", "notes")) if appointment else None
                 visits.append(visit)
             attachments = [selected(item, ("id", "patient_id", "mime", "size", "sha256", "status", "privacy_checked")) for item in snapshot["attachments"]]
-            return {"schema_version": SCHEMA_VERSION, "patients": patients, "visits": visits, "attachments": attachments}
+            reports = [selected(item, ("id", "patient_id", "date", "title", "category", "facility", "doctor", "summary", "notes", "status", "privacy_reviewed", "source_file_ids", "created_at", "updated_at", "reviewed_at")) for item in snapshot["reports"]]
+            return {"schema_version": SCHEMA_VERSION, "patients": patients, "visits": visits, "reports": reports, "attachments": attachments}
 
     def queue(self):
         with self.lock:
             data = self.data()
             items = []
-            linked = {fid for visit in data["visits"] for fid in self._all_source_ids(visit)}
+            linked = {fid for visit in data["visits"] + data["reports"] for fid in self._all_source_ids(visit)}
             for item in data["attachments"]:
                 if item["id"] not in linked:
-                    items.append({"id": item["id"], "patient_id": item["patient_id"], "path": str(self.attachment_path(item["id"])), "mime": item["mime"], "privacy_checked": item["privacy_checked"]})
+                    items.append({"id": item["id"], "patient_id": item["patient_id"], "path": str(self.attachment_path(item["id"])), "mime": item["mime"], "privacy_checked": item["privacy_checked"], "kind": item.get("kind", "visit"), "source_group": item.get("source_group"), "pages": item.get("pages")})
             return {"schema_version": SCHEMA_VERSION, "pending": items, "instructions": "只轉錄可見資料；不要保留病人姓名、證件、生日、地址或聯絡資料。人物用 grandpa/grandma；可保留年齡性別。醫生及診斷照原文保留。模糊藥名、劑量、日期寫入 review_notes，勿猜測。透過 tools/import_record.py 匯入 draft，先遮蓋相片再由使用者確認。"}
 
     def _archive_bytes(self):
@@ -608,7 +778,8 @@ class HealthStore:
             raw = self.attachment_path(item["id"]).read_bytes()
             if digest(raw) != item["sha256"]:
                 raise ValidationError("相片檢查碼不符，請檢查本機檔案")
-            files["media/" + item["id"] + ".png"] = raw
+            extension = ".pdf" if item["mime"] == "application/pdf" else ".png"
+            files["media/" + item["id"] + extension] = raw
             if len(files) >= MAX_BACKUP_FILES - 2 or sum(len(value) for value in files.values()) > MAX_BACKUP_BYTES:
                 raise ValidationError("已超過單一備份 512 MB 或 4,998 張相片上限，請先分批歸檔")
         raw_snapshot = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
@@ -630,7 +801,7 @@ class HealthStore:
             temp.write_bytes(raw)
             os.replace(temp, path)
             data = self.data()
-            result = {"name": name, "path": str(path), "created_at": manifest["created_at"], "excluded_pending": sum(not a.get("privacy_checked") for a in data["attachments"]), "excluded_drafts": sum(v["status"] != "confirmed" for v in data["visits"])}
+            result = {"name": name, "path": str(path), "created_at": manifest["created_at"], "excluded_pending": sum(not a.get("privacy_checked") for a in data["attachments"]), "excluded_drafts": sum(v["status"] != "confirmed" for v in data["visits"] + data["reports"])}
             self.set_metadata("last_backup", result)
             return result
 
@@ -672,19 +843,40 @@ class HealthStore:
             snapshot = json.loads(files["archive.json"])
             if snapshot.get("schema_version") != 1 or not all(isinstance(snapshot.get(k), list) for k in ("patients", "visits", "attachments")):
                 raise ValidationError("備份資料格式錯誤")
+            snapshot.setdefault("reports", [])
+            if not isinstance(snapshot["reports"], list):
+                raise ValidationError("備份報告格式錯誤")
             attachment_ids = set()
+            expected_files = {"archive.json"}
             for item in snapshot["attachments"]:
                 item_id = identifier(item.get("id"), "a_")
                 if item_id in attachment_ids or not item.get("privacy_checked") or item.get("patient_id") not in PATIENTS:
                     raise ValidationError("備份包含未核對相片或重複紀錄")
                 attachment_ids.add(item_id)
-                content = files.get("media/" + item_id + ".png")
-                if content is None or digest(content) != item.get("sha256") or item.get("mime") != "image/png":
+                extension = {"image/png": ".png", "application/pdf": ".pdf"}.get(item.get("mime"))
+                if extension is None:
+                    raise ValidationError("備份來源格式不支援")
+                media_name = "media/" + item_id + extension
+                expected_files.add(media_name)
+                content = files.get(media_name)
+                if content is None or digest(content) != item.get("sha256") or len(content) != item.get("size"):
                     raise ValidationError("備份相片不完整")
-                mime, _ = inspect_image(content, allow_pdf=False)
-                if mime != "image/png":
+                mime, _ = inspect_image(content)
+                if mime != item["mime"]:
                     raise ValidationError("備份相片格式錯誤")
-            expected_files = {"archive.json"} | {"media/" + x + ".png" for x in attachment_ids}
+                if mime == "application/pdf" and item.get("pages") != pdf.info(content)["pages"]:
+                    raise ValidationError("備份 PDF 頁數與清單不符")
+            needed = set()
+            for table in ("visits", "reports"):
+                record_ids = set()
+                for record in snapshot[table]:
+                    record_id = record.get("id")
+                    if not isinstance(record_id, str) or not SAFE_ID.fullmatch(record_id) or record_id in record_ids:
+                        raise ValidationError("備份紀錄編號錯誤或重複")
+                    record_ids.add(record_id)
+                    needed.update(self._all_source_ids(record))
+            if needed != attachment_ids:
+                raise ValidationError("備份來源與紀錄連結不符")
             if set(files) != expected_files:
                 raise ValidationError("備份包含未識別資料")
             return snapshot, manifest, files
@@ -702,7 +894,7 @@ class HealthStore:
                     Path(old["path"]).unlink(missing_ok=True)
                     self.restore_tokens.pop(old_token)
             self.restore_tokens[token] = {"path": path, "expires": time.time() + 600, "sha256": digest(raw)}
-        return {"token": token, "visits": len(snapshot["visits"]), "attachments": len(snapshot["attachments"]), "created_at": manifest["created_at"]}
+        return {"token": token, "visits": len(snapshot["visits"]), "reports": len(snapshot["reports"]), "attachments": len(snapshot["attachments"]), "created_at": manifest["created_at"]}
 
     def restore_apply(self, token):
         with self.lock:
@@ -720,10 +912,15 @@ class HealthStore:
                 for patient in snapshot["patients"]:
                     test_store.update_patient(patient)
                 for attachment in snapshot["attachments"]:
-                    clean = {"id": attachment["id"], "patient_id": attachment["patient_id"], "path": "archive/" + attachment["id"] + ".png", "original_name": "", "ocr_text": "", "archive_name": attachment["id"] + ".png", "mime": "image/png", "status": "linked", "privacy_checked": True, "privacy_reviewed_at": now(), "imported_at": text(attachment.get("imported_at"), 80) or now()}
+                    is_pdf = attachment["mime"] == "application/pdf"
+                    extension = ".pdf" if is_pdf else ".png"
+                    clean = {"id": attachment["id"], "patient_id": attachment["patient_id"], "path": "archive/" + attachment["id"] + extension, "original_name": "", "ocr_text": "", "archive_name": attachment["id"] + extension, "mime": attachment["mime"], "status": "linked", "privacy_checked": True, "privacy_reviewed_at": now(), "imported_at": text(attachment.get("imported_at"), 80) or now(), "kind": "report" if attachment.get("kind") == "report" else "visit"}
                     # A backup may be valid yet produced by another program.
                     # Keep pixel content, but never restore source metadata.
-                    pixels = clean_image(files["media/" + attachment["id"] + ".png"])
+                    incoming_bytes = files["media/" + attachment["id"] + extension]
+                    pixels = pdf.clean_restored(incoming_bytes) if is_pdf else clean_image(incoming_bytes)
+                    if is_pdf:
+                        clean["pages"] = pdf.info(pixels)["pages"]
                     clean.update(sha256=digest(pixels), size=len(pixels))
                     (check_dir / clean["path"]).write_bytes(pixels)
                     test_store._put("attachments", clean)
@@ -735,21 +932,35 @@ class HealthStore:
                     visit_ids.add(visit.get("id"))
                     validated = test_store.upsert_visit(visit)
                     test_store.confirm_visit(validated["id"], reviewed=True)
+                report_ids = set()
+                for report in snapshot["reports"]:
+                    if report.get("status") != "confirmed" or report.get("privacy_reviewed") is not True or report.get("id") in report_ids:
+                        raise ValidationError("備份包含未確認或重複報告")
+                    report_ids.add(report.get("id"))
+                    validated = test_store.upsert_report(report)
+                    test_store.confirm_report(validated["id"], reviewed=True)
                 ready = test_store.confirmed_snapshot()
                 pre_restore = self.backup()
                 # All imported objects validated. Copy files to collision-free names first.
                 replacements = []
                 for attachment in ready["attachments"]:
-                    name = "restored_" + secrets.token_hex(4) + "_" + attachment["archive_name"]
-                    relative = "archive/" + name
-                    shutil.copyfile(test_store.attachment_path(attachment["id"]), self.data_dir / relative)
-                    replacements.append({**attachment, "path": relative, "archive_name": name})
+                    generated_path = test_store.attachment_path(attachment["id"]).relative_to(test_store.data_dir)
+                    destination = self.data_dir / generated_path
+                    if destination.exists():
+                        destination = destination.with_name(destination.stem + "_restored_" + secrets.token_hex(4) + destination.suffix)
+                    if not destination.resolve().is_relative_to(self.data_dir / "archive"):
+                        raise ValidationError("還原歸檔路徑不安全")
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(test_store.attachment_path(attachment["id"]), destination)
+                    internal = test_store._get("attachments", attachment["id"])
+                    replacements.append({**attachment, "path": destination.relative_to(self.data_dir).as_posix(), "archive_name": destination.name, "archive_owner_id": internal.get("archive_owner_id")})
                 # Preserve local drafts and unreviewed images, even when restoring
                 # an earlier version whose IDs overlap with a current draft.
                 current = self.data()
                 drafts = [v for v in current["visits"] if v["status"] != "confirmed"]
-                draft_sources = {fid for v in drafts for fid in self._all_source_ids(v)}
-                confirmed_sources = {fid for v in current["visits"] if v["status"] == "confirmed" for fid in self._all_source_ids(v)}
+                draft_reports = [r for r in current["reports"] if r["status"] != "confirmed"]
+                draft_sources = {fid for v in drafts + draft_reports for fid in self._all_source_ids(v)}
+                confirmed_sources = {fid for v in current["visits"] + current["reports"] if v["status"] == "confirmed" for fid in self._all_source_ids(v)}
                 incoming = {a["id"]: a for a in replacements}
                 kept_attachments = []
                 remap = {}
@@ -770,9 +981,14 @@ class HealthStore:
                     visit["source_file_ids"] = [remap.get(fid, fid) for fid in visit["source_file_ids"]]
                     for med in visit["medicines"]:
                         med["source_file_ids"] = [remap.get(fid, fid) for fid in med["source_file_ids"]]
+                incoming_report_ids = {r["id"] for r in ready["reports"]}
+                for report in draft_reports:
+                    if report["id"] in incoming_report_ids:
+                        report["id"] = "r_local_" + uuid.uuid4().hex
+                    report["source_file_ids"] = [remap.get(fid, fid) for fid in report["source_file_ids"]]
                 self.db.execute("BEGIN IMMEDIATE")
                 try:
-                    for table in ("visits", "attachments", "patients"):
+                    for table in ("visits", "reports", "attachments", "patients"):
                         self.db.execute(f"DELETE FROM {table}")
                     for patient in ready["patients"]:
                         self._put("patients", patient)
@@ -780,13 +996,15 @@ class HealthStore:
                         self._put("attachments", attachment)
                     for visit in ready["visits"] + drafts:
                         self._put("visits", visit)
+                    for report in ready["reports"] + draft_reports:
+                        self._put("reports", report)
                     self.db.commit()
                 except Exception:
                     self.db.rollback()
                     raise
                 self.set_metadata("last_sync", None)
                 cached["path"].unlink(missing_ok=True)
-                return {"restored": True, "visits": len(ready["visits"]), "attachments": len(ready["attachments"]), "preserved_drafts": len(drafts), "preserved_pending": len(kept_attachments), "pre_restore_backup": pre_restore["name"]}
+                return {"restored": True, "visits": len(ready["visits"]), "reports": len(ready["reports"]), "attachments": len(ready["attachments"]), "preserved_drafts": len(drafts) + len(draft_reports), "preserved_pending": len(kept_attachments), "pre_restore_backup": pre_restore["name"]}
             finally:
                 test_store.close()
                 if check_dir.is_relative_to(self.data_dir / "restore"):
@@ -800,4 +1018,4 @@ class HealthStore:
             temp = target.with_suffix(".tmp")
             temp.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(temp, target)
-            return {"path": str(target), "visits": len(snapshot["visits"]), "attachments": len(snapshot["attachments"])}
+            return {"path": str(target), "visits": len(snapshot["visits"]), "reports": len(snapshot["reports"]), "attachments": len(snapshot["attachments"])}

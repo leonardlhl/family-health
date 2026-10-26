@@ -54,9 +54,9 @@ try {
     if (-not $pythonExecutable) {
         throw 'Python 3.10 or newer was not found. Install Python from python.org, then open START.cmd again.'
     }
-    & $pythonExecutable -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PIL') else 1)" 2>$null
+    & $pythonExecutable -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PIL') and importlib.util.find_spec('pymupdf') else 1)" 2>$null
     if ($LASTEXITCODE -ne 0) {
-        Write-Host 'The image library is missing. Run this command in PowerShell, then open START.cmd again:'
+        Write-Host 'An image/PDF library is missing. Run this command in PowerShell, then open START.cmd again:'
         Write-Host ('& "' + $pythonExecutable + '" -m pip install -r "' + (Join-Path $projectDirectory 'requirements.txt') + '"')
         exit 1
     }

@@ -11,11 +11,12 @@ const ID = /^[A-Za-z0-9_-]{1,96}$/;
 const ARCHIVE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const HASH = /^[a-f0-9]{64}$/;
 const ALIASES = {grandpa:'爺爺',grandma:'嬷嬷'};
-const EXTENSIONS = {'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp'};
+const EXTENSIONS = {'image/png':'.png','image/jpeg':'.jpg','image/webp':'.webp','application/pdf':'.pdf'};
 const DENIED = 'This private link is unavailable.';
 const MAX_BODY = 4096;
 const MAX_SNAPSHOT = 16 * 1024 * 1024;
 const MAX_IMAGE = 25 * 1024 * 1024;
+const MAX_PDF = 50000000;
 const MAX_PREVIEW = 3 * 1024 * 1024;
 
 class Denied extends Error {}
@@ -44,15 +45,17 @@ async function boundedBytes(value, limit) {
   return bytes;
 }
 
-function validAsset(asset, expectedPath, preview = false) {
-  return asset && asset.object_path === expectedPath && HASH.test(asset.sha256)
-    && Number.isInteger(asset.size) && asset.size > 0 && asset.size <= (preview ? MAX_PREVIEW : MAX_IMAGE)
+function validAsset(asset, expectedPaths, preview = false) {
+  return asset && expectedPaths.includes(asset.object_path) && HASH.test(asset.sha256)
+    && Number.isInteger(asset.size) && asset.size > 0
+    && asset.size <= (preview ? MAX_PREVIEW : asset.mime === 'application/pdf' ? MAX_PDF : MAX_IMAGE)
     && (preview ? asset.mime === 'image/jpeg' : Object.hasOwn(EXTENSIONS, asset.mime));
 }
 
 function checkedSnapshot(value, archiveId, version) {
   requireAccess(value?.schema_version === 1 && Array.isArray(value.patients)
-    && Array.isArray(value.visits) && Array.isArray(value.attachments));
+    && Array.isArray(value.visits) && Array.isArray(value.attachments)
+    && (value.reports === undefined || Array.isArray(value.reports)));
   const patients = new Set();
   for (const patient of value.patients) {
     requireAccess(Object.hasOwn(ALIASES, patient?.id) && !patients.has(patient.id)
@@ -63,30 +66,47 @@ function checkedSnapshot(value, archiveId, version) {
   for (const file of value.attachments) {
     requireAccess(file && typeof file.id === 'string' && ID.test(file.id) && !files.has(file.id) && patients.has(file.patient_id)
       && file.privacy_checked === true && Object.hasOwn(EXTENSIONS, file.mime));
-    requireAccess(validAsset(file, `${archiveId}/${version}/${file.id}${EXTENSIONS[file.mime]}`));
+    requireAccess(validAsset(file, [`${archiveId}/${version}/${file.id}${EXTENSIONS[file.mime]}`,
+      `${archiveId}/objects/${file.id}-${file.sha256}${EXTENSIONS[file.mime]}`]));
+    if (file.mime === 'application/pdf') requireAccess(file.thumbnail !== undefined);
     if (file.thumbnail !== undefined) {
-      requireAccess(validAsset(file.thumbnail, `${archiveId}/${version}/${file.id}.thumb.jpg`, true)
+      requireAccess(validAsset(file.thumbnail, [`${archiveId}/${version}/${file.id}.thumb.jpg`,
+        `${archiveId}/objects/${file.id}-${file.thumbnail?.sha256}.thumb.jpg`], true)
         && ['width','height'].every(key => Number.isInteger(file.thumbnail[key])
           && file.thumbnail[key] >= 1 && file.thumbnail[key] <= 960));
     }
     files.set(file.id, file);
   }
   const linked = new Set();
+  const checkSources = (sources, patientId) => {
+    requireAccess(Array.isArray(sources));
+    for (const id of sources) {
+      requireAccess(files.has(id) && files.get(id).patient_id === patientId);
+      linked.add(id);
+    }
+  };
   const visits = new Set();
   for (const visit of value.visits) {
     requireAccess(visit && typeof visit.id === 'string' && ID.test(visit.id) && !visits.has(visit.id) && patients.has(visit.patient_id)
       && visit.status === 'confirmed' && visit.privacy_reviewed === true && Array.isArray(visit.medicines));
     visits.add(visit.id);
     for (const sources of [visit.source_file_ids, ...visit.medicines.map(medicine => medicine?.source_file_ids)]) {
-      requireAccess(Array.isArray(sources));
-      for (const id of sources) {
-        requireAccess(files.has(id) && files.get(id).patient_id === visit.patient_id);
-        linked.add(id);
-      }
+      checkSources(sources, visit.patient_id);
     }
   }
+  const reports = new Set();
+  for (const report of value.reports || []) {
+    requireAccess(report && typeof report.id === 'string' && ID.test(report.id) && !reports.has(report.id)
+      && patients.has(report.patient_id) && report.status === 'confirmed' && report.privacy_reviewed === true
+      && typeof report.reviewed_at === 'string' && !!report.reviewed_at
+      && typeof report.title === 'string' && !!report.title.trim()
+      && typeof report.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(report.date)
+      && Array.isArray(report.source_file_ids) && report.source_file_ids.length > 0 && !report.review_notes);
+    reports.add(report.id);
+    checkSources(report.source_file_ids, report.patient_id);
+  }
   requireAccess(linked.size === files.size);
-  return value;
+  return {...value,reports:value.reports || []};
 }
 
 export function createHandler(options = {}) {
@@ -179,7 +199,7 @@ export function createHandler(options = {}) {
         return archives[0];
       };
       const archive = await readArchive();
-      let snapshot = {schema_version:1,patients:[],visits:[],attachments:[]};
+      let snapshot = {schema_version:1,patients:[],visits:[],reports:[],attachments:[]};
       let publishedAt = archive.published_at;
       if (archive.current_version !== null) {
         const versions = await rows('family_snapshots', {select:'archive_id,version_id,snapshot,published_at',
@@ -215,7 +235,7 @@ export function createHandler(options = {}) {
       const image = await upstream('/storage/v1/object/authenticated/family-health/'
         + asset.object_path.split('/').map(encodeURIComponent).join('/'));
       requireAccess(image.headers.get('content-type')?.split(';')[0].trim().toLowerCase() === asset.mime);
-      const bytes = await boundedBytes(image, usePreview ? MAX_PREVIEW : MAX_IMAGE);
+      const bytes = await boundedBytes(image, usePreview ? MAX_PREVIEW : asset.mime === 'application/pdf' ? MAX_PDF : MAX_IMAGE);
       requireAccess(bytes.byteLength === asset.size && await digest(bytes) === asset.sha256);
       await recheck();
       return response(bytes, 200, origin, {'Content-Type':asset.mime,

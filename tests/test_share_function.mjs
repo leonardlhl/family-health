@@ -4,7 +4,7 @@ import test from 'node:test';
 import {createHash, webcrypto} from 'node:crypto';
 
 const source = await readFile(new URL('../supabase/functions/family-share/index.ts', import.meta.url), 'utf8');
-const {createHandler} = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
+const {createHandler} = await import('data:text/javascript;base64,' + Buffer.from(source+'\n//# sourceURL=family-share-test.js').toString('base64'));
 const ORIGIN = 'https://leonardlhl.github.io';
 const TOKEN = 'A'.repeat(43);
 const TOKEN_HASH = createHash('sha256').update(TOKEN).digest('hex');
@@ -73,8 +73,8 @@ function harness(change = () => {}) {
     }
     if (parsed.pathname.startsWith('/storage/')) {
       const preview = parsed.pathname.endsWith('.thumb.jpg');
-      return new Response(state.badBytes ? new Uint8Array([0]) : preview ? PREVIEW : FULL,
-        {headers:{'Content-Type':state.storageMime || (preview ? 'image/jpeg' : 'image/png')}});
+      return new Response(state.badBytes ? new Uint8Array([0]) : preview ? PREVIEW : state.fileBytes || FULL,
+        {headers:{'Content-Type':state.storageMime || (preview ? 'image/jpeg' : state.snapshot.attachments[0].mime)}});
     }
     throw new Error('Unexpected offline fetch');
   };
@@ -95,7 +95,7 @@ test('snapshot uses token-derived archive and responds without caching or creden
   const body = await result.text();
   assert.equal(body.includes(TOKEN),false);
   assert.equal(body.includes(KEY),false);
-  assert.deepEqual(JSON.parse(body),{...h.state.snapshot,published_at:h.state.archive.published_at});
+  assert.deepEqual(JSON.parse(body),{...h.state.snapshot,reports:[],published_at:h.state.archive.published_at});
   assert.equal(h.calls.filter(c=>c.url.includes('family_share_links')).length,2);
 });
 
@@ -225,4 +225,48 @@ test('share table and management RPCs have no browser grants; gateway JWT verifi
   assert.doesNotMatch(sql,/create policy/i);
   const config=await readFile(new URL('../supabase/config.toml',import.meta.url),'utf8');
   assert.match(config,/\[functions\.family-share\][\s\S]*verify_jwt = false/);
+});
+
+function reportOnly(state,pdf=false,cas=false){
+  state.snapshot.visits=[];
+  state.snapshot.reports=[{id:'report1',patient_id:'grandpa',date:'2026-10-26',title:'SYNTHETIC REPORT',
+    status:'confirmed',privacy_reviewed:true,reviewed_at:'2026-10-26T00:00:00Z',source_file_ids:['file1']}];
+  const file=state.snapshot.attachments[0];
+  if(pdf){
+    state.fileBytes=new TextEncoder().encode('%PDF-1.7 synthetic sanitized fixture');
+    file.mime='application/pdf';file.size=state.fileBytes.length;file.sha256=sha(state.fileBytes);
+    file.object_path=`family/${VERSION}/file1.pdf`;
+  }
+  if(cas){
+    file.object_path=`family/objects/file1-${file.sha256}${pdf?'.pdf':'.png'}`;
+    file.thumbnail.object_path=`family/objects/file1-${file.thumbnail.sha256}.thumb.jpg`;
+  }
+}
+
+test('confirmed reports and PDF original/first-page JPEG work on legacy and immutable paths',async()=>{
+  for(const cas of [false,true]){
+    const h=harness(s=>reportOnly(s,true,cas));
+    const snapshot=await h.request();assert.equal(snapshot.status,200);
+    assert.equal((await snapshot.json()).reports[0].id,'report1');
+    const full=await h.request({token:TOKEN,action:'file',attachmentId:'file1',thumbnail:false});
+    assert.equal(full.status,200);assert.equal(full.headers.get('Content-Type'),'application/pdf');
+    assert.deepEqual(new Uint8Array(await full.arrayBuffer()),h.state.fileBytes);
+    const preview=await h.request({token:TOKEN,action:'file',attachmentId:'file1',thumbnail:true});
+    assert.equal(preview.status,200);assert.equal(preview.headers.get('Content-Type'),'image/jpeg');
+    assert.deepEqual(new Uint8Array(await preview.arrayBuffer()),PREVIEW);
+  }
+});
+
+test('reports cannot expose other patients, drafts, unchecked PDFs or mismatched immutable hashes',async()=>{
+  for(const change of [
+    s=>{s.snapshot.reports[0].patient_id='grandma';},s=>{s.snapshot.reports[0].status='draft';},
+    s=>{s.snapshot.reports[0].privacy_reviewed=false;},s=>{s.snapshot.reports[0].source_file_ids=[];},
+    s=>{s.snapshot.reports[0].review_notes='UNRESOLVED';},
+    s=>{delete s.snapshot.attachments[0].thumbnail;},s=>{s.snapshot.attachments[0].size=50000001;},
+    s=>{s.snapshot.attachments[0].object_path=`family/objects/file1-${'f'.repeat(64)}.pdf`;},
+  ]){
+    const h=harness(s=>{reportOnly(s,true,true);change(s);});
+    assert.equal((await h.request()).status,403);
+    assert.equal(h.calls.some(c=>c.url.includes('/storage/')),false);
+  }
 });
